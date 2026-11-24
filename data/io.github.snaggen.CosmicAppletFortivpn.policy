@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- @LIBEXECDIR@ is replaced by `just install-helper`. -->
+<policyconfig>
+  <vendor>cosmic-applet-fortivpn</vendor>
+
+  <!-- Connect and disconnect: the helper only takes a login from the caller and uses the
+       admin-owned gateway config, so the active local user may run it without a password. -->
+  <action id="io.github.snaggen.CosmicAppletFortivpn.connect">
+    <description>Connect to the Fortinet VPN</description>
+    <description xml:lang="sv">Anslut till Fortinet-VPN:et</description>
+    <message>Authentication is required to connect to the VPN</message>
+    <message xml:lang="sv">Autentisering krävs för att ansluta till VPN:et</message>
+    <icon_name>network-vpn-symbolic</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/cosmic-applet-fortivpn-helper</annotate>
+  </action>
+
+  <!-- Changing the gateway or trusting its certificate decides where all traffic may be
+       routed, so it needs an admin. -->
+  <action id="io.github.snaggen.CosmicAppletFortivpn.configure">
+    <description>Configure the Fortinet VPN gateway</description>
+    <description xml:lang="sv">Ställ in gateway för Fortinet-VPN:et</description>
+    <message>Authentication is required to change the VPN gateway or trust its certificate</message>
+    <message xml:lang="sv">Autentisering krävs för att ändra VPN-gatewayen eller lita på dess certifikat</message>
+    <icon_name>network-vpn-symbolic</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/cosmic-applet-fortivpn-configure</annotate>
+  </action>
+</policyconfig>
