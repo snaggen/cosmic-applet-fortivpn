@@ -1,0 +1,23 @@
+[package]
+name = "cosmic-applet-fortivpn"
+version = "0.1.0"
+edition = "2024"
+description = "COSMIC panel applet for Fortinet SSL VPN with SAML login, using openfortivpn"
+license = "GPL-3.0-only"
+
+[dependencies]
+i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10"
+rust-embed = "8.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+# Same revision as cosmic-applets uses, so the applet API matches the panel.
+rev = "5a8bd9482a35ae94c1e54edf77b331c6b970f170"
+default-features = false
+features = ["applet", "applet-token", "dbus-config", "multi-window", "tokio", "wayland", "winit"]
+
+[profile.release]
+lto = "thin"
