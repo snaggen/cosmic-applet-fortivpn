@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! The SAML session id that ends a login, and handing it to openfortivpn.
 //!

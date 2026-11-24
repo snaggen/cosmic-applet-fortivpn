@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Runs the login window (`cosmic-applet-fortivpn-login`) for the agent, in place of the
 //! system browser. It ends with the SAML session id, which the agent hands to openfortivpn.

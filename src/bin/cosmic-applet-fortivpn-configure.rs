@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Writes the root-owned VPN profiles. Started by the agent through pkexec; polkit asks for an
 //! admin password, since a profile decides where the VPN connects and which certificate counts

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! The line protocol between the applet and the helper that runs openfortivpn.
 //!

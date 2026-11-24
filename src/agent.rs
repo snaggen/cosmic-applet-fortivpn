@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! The agent: one process per user session that owns the tunnel and shows dialogs.
 //!

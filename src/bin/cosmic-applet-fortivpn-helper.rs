@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Runs openfortivpn as root on behalf of the applet. Started by the applet through pkexec.
 //!

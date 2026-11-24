@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Reconnecting by itself, when the user turned it on: after a lost tunnel, and after resume
 //! when the tunnel was up before sleep. Off by default.

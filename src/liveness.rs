@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Noticing a dead tunnel. openfortivpn has no keepalive: when the network under the tunnel
 //! goes away, its TLS connection just stalls and it keeps reporting nothing.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Running openfortivpn: its config file, and turning its output into [`Event`]s.
 //!

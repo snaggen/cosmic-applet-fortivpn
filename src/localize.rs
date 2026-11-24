@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! Translations: Fluent files under `i18n/<lang>/`, embedded at build time.
 //! English is the fallback; the desktop's language settings pick the rest.

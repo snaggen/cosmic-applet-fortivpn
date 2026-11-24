@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: EUPL-1.2
 
 //! The SAML login window: a WebKitGTK view that takes the user through the gateway's SAML
 //! login, in place of the system browser. Started by the agent; a separate process keeps GTK's

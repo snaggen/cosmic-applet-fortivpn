@@ -198,4 +198,4 @@ that.
 
 ## License
 
-GPL-3.0-only.
+Licensed under the [European Union Public Licence v. 1.2](LICENSE) (EUPL-1.2).
