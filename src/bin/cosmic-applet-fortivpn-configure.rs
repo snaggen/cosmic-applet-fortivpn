@@ -7,11 +7,17 @@
 //! cosmic-applet-fortivpn-configure set-gateway <host:port>
 //! cosmic-applet-fortivpn-configure trust-cert <sha256 digest>
 //! cosmic-applet-fortivpn-configure forget-cert
+//! cosmic-applet-fortivpn-configure trust-cert-once <sha256 digest>
 //! ```
 //!
 //! Changing the gateway forgets the trusted certificate, which belonged to the old one.
+//! `trust-cert-once` trusts a certificate for the next connection only: the helper reads it
+//! from the runtime directory and removes it when that connection ends.
 
-use cosmic_applet_fortivpn::gateway::{self, CertDigest, Gateway};
+use cosmic_applet_fortivpn::{
+    RUN_DIR, SESSION_TRUST_PATH,
+    gateway::{self, CertDigest, Gateway},
+};
 use std::{
     fs::{self, DirBuilder, OpenOptions},
     io::Write,
@@ -21,7 +27,7 @@ use std::{
 };
 
 const USAGE: &str = "usage: cosmic-applet-fortivpn-configure \
-    set-gateway <host:port> | trust-cert <sha256> | forget-cert";
+    set-gateway <host:port> | trust-cert <sha256> | forget-cert | trust-cert-once <sha256>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,9 +44,40 @@ fn run(args: &[String]) -> Result<(), String> {
     if !rustix::process::geteuid().is_root() {
         return Err("must run as root, through pkexec".into());
     }
+    if let [cmd, digest] = args
+        && cmd == "trust-cert-once"
+    {
+        let digest: CertDigest = digest.parse().map_err(|err| format!("{digest}: {err}"))?;
+        return write_session_trust(&digest);
+    }
     let current = Gateway::load().map_err(|err| format!("{}: {err}", gateway::CONFIG_PATH))?;
     let updated = apply(current, args)?;
-    write_config(&updated)
+    write_config(&updated)?;
+    // A certificate trusted once belonged to the gateway as it was.
+    match fs::remove_file(SESSION_TRUST_PATH) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("{SESSION_TRUST_PATH}: {err}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Trusts a certificate for the next connection: root-only, in the helper's runtime dir.
+fn write_session_trust(digest: &CertDigest) -> Result<(), String> {
+    let failed = |err: std::io::Error| format!("{SESSION_TRUST_PATH}: {err}");
+    DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(RUN_DIR)
+        .map_err(failed)?;
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(SESSION_TRUST_PATH)
+        .and_then(|mut file| file.write_all(format!("{digest}\n").as_bytes()))
+        .map_err(failed)
 }
 
 /// Applies one command to the current config.

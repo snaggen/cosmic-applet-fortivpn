@@ -27,3 +27,10 @@ pub const HELPER_NAME: &str = "cosmic-applet-fortivpn-helper";
 
 /// File name of the helper that writes the gateway config.
 pub const CONFIGURE_NAME: &str = "cosmic-applet-fortivpn-configure";
+
+/// Runtime directory of the root helpers (mode 0700). Only root can write `/run`.
+pub const RUN_DIR: &str = "/run/cosmic-applet-fortivpn";
+
+/// A certificate digest trusted for the next connection only, written by
+/// `configure trust-cert-once` and removed by the helper when that connection ends.
+pub const SESSION_TRUST_PATH: &str = "/run/cosmic-applet-fortivpn/session-trust";

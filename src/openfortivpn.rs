@@ -10,7 +10,7 @@
 //! ```
 
 use crate::{
-    gateway::Gateway,
+    gateway::{CertDigest, Gateway},
     protocol::{Event, UntrustedCert},
 };
 
@@ -19,12 +19,14 @@ pub const OPENFORTIVPN: &str = "/usr/bin/openfortivpn";
 
 /// The config file passed with `-c`. Passing our own file keeps openfortivpn from reading
 /// `/etc/openfortivpn/config`, so nothing but the gateway config decides how it runs.
-pub fn config_file(gateway: &Gateway) -> String {
+/// `session_trust` is a certificate trusted for this connection only; openfortivpn accepts
+/// several `trusted-cert` lines.
+pub fn config_file(gateway: &Gateway, session_trust: Option<&CertDigest>) -> String {
     let mut text = format!(
         "host = {}\nport = {}\npersistent = 0\n",
         gateway.host, gateway.port
     );
-    if let Some(cert) = &gateway.trusted_cert {
+    for cert in gateway.trusted_cert.iter().chain(session_trust) {
         text.push_str(&format!("trusted-cert = {cert}\n"));
     }
     text
@@ -143,11 +145,21 @@ mod tests {
     fn config_file_has_only_gateway_settings() {
         let mut gw: Gateway = "vpn.example.com:10443".parse().unwrap();
         assert_eq!(
-            config_file(&gw),
+            config_file(&gw, None),
             "host = vpn.example.com\nport = 10443\npersistent = 0\n"
         );
         gw.trusted_cert = Some(DIGEST.parse().unwrap());
-        assert!(config_file(&gw).ends_with(&format!("trusted-cert = {DIGEST}\n")));
+        assert!(config_file(&gw, None).ends_with(&format!("trusted-cert = {DIGEST}\n")));
+    }
+
+    #[test]
+    fn config_file_adds_session_trust() {
+        let mut gw: Gateway = "vpn.example.com:10443".parse().unwrap();
+        let once: CertDigest = "a".repeat(64).parse().unwrap();
+        assert!(config_file(&gw, Some(&once)).ends_with(&format!("trusted-cert = {once}\n")));
+        gw.trusted_cert = Some(DIGEST.parse().unwrap());
+        let text = config_file(&gw, Some(&once));
+        assert_eq!(text.matches("trusted-cert = ").count(), 2);
     }
 
     #[test]

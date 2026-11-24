@@ -11,7 +11,8 @@
 //! other than the validated cookie.
 
 use cosmic_applet_fortivpn::{
-    gateway::Gateway,
+    RUN_DIR, SESSION_TRUST_PATH,
+    gateway::{CertDigest, Gateway},
     openfortivpn::{self, OutputParser},
     protocol::{Event, HelperError, Request},
 };
@@ -28,9 +29,6 @@ use std::{
     sync::mpsc,
     thread,
 };
-
-/// Runtime directory for the lock and openfortivpn's config. Only root can write `/run`.
-const RUN_DIR: &str = "/run/cosmic-applet-fortivpn";
 
 /// Upper bound for the request line; a cookie is at most 4000 bytes.
 const MAX_REQUEST_LEN: u64 = 8192;
@@ -141,7 +139,8 @@ fn lock() -> Result<File, HelperError> {
     }
 }
 
-/// openfortivpn's config file, removed again on drop.
+/// openfortivpn's config file, removed again on drop together with the session trust,
+/// which is valid for this one connection.
 struct ConfigFile {
     path: PathBuf,
 }
@@ -149,13 +148,15 @@ struct ConfigFile {
 impl ConfigFile {
     fn write(gateway: &Gateway) -> Result<Self, HelperError> {
         let path = Path::new(RUN_DIR).join("openfortivpn.conf");
+        let session_trust = read_session_trust();
+        let text = openfortivpn::config_file(gateway, session_trust.as_ref());
         OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
             .open(&path)
-            .and_then(|mut file| file.write_all(openfortivpn::config_file(gateway).as_bytes()))
+            .and_then(|mut file| file.write_all(text.as_bytes()))
             .map_err(|err| HelperError::Failed(format!("{}: {err}", path.display())))?;
         Ok(Self { path })
     }
@@ -164,7 +165,14 @@ impl ConfigFile {
 impl Drop for ConfigFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(SESSION_TRUST_PATH);
     }
+}
+
+/// The certificate an admin trusted for this connection only, if any. Written by
+/// `configure trust-cert-once`; an unreadable or invalid file trusts nothing.
+fn read_session_trust() -> Option<CertDigest> {
+    fs::read_to_string(SESSION_TRUST_PATH).ok()?.parse().ok()
 }
 
 /// Starts openfortivpn with our config file and a clean environment.
