@@ -16,7 +16,7 @@ save = Save
 
 gateway = Gateway
 gateway-placeholder = vpn.example.com:443
-gateway-missing = Enter the address of the VPN gateway. Saving it needs an administrator password.
+gateway-missing = Add your VPN account: a name and the address of the VPN gateway. Saving it needs an administrator password.
 gateway-invalid = Enter host and port, e.g. vpn.example.com:443
 gateway-unreadable = The gateway settings could not be read: { $reason }
 
@@ -50,7 +50,7 @@ notify-failed = The VPN connection could not be established
 settings = Settings
 change = Change
 forget = Forget
-gateway-change = Enter the new address of the VPN gateway. Saving it needs an administrator password.
+gateway-change = Change the VPN account. Saving it needs an administrator password.
 certificate = Certificate
 certificate-system = Verified by the system
 certificate-trusted = Trusted certificate (SHA-256)
@@ -64,3 +64,22 @@ decimal-separator = .
 status-reconnecting = Reconnecting…
 auto-reconnect = Reconnect automatically
 notify-reconnect-failed = The VPN could not reconnect
+
+password-dialog-title = Log in to the VPN
+password-dialog-body = Log in to { $name }.
+username = Username
+password = Password
+otp = One-time code
+otp-placeholder = Only if your VPN asks for one
+remember-password = Remember password
+password-invalid = Enter username and password without line breaks or leading and trailing spaces (username up to 64 bytes, password up to 256); a one-time code has only letters and digits.
+
+add-profile = Add account
+remove = Remove
+profile-name = Name
+profile-name-placeholder = Customer or company
+profile-name-invalid = Enter a name of at most 64 characters with a letter or digit.
+profile-add-intro = Add a VPN account. Saving it needs an administrator password.
+password-login = Log in with username and password (instead of single sign-on)
+method-saml = single sign-on
+method-password = password

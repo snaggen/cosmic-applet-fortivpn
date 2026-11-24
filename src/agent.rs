@@ -9,7 +9,7 @@
 
 use crate::{
     bus::{self, AgentCommand, BusUpdate, Snapshot},
-    fl,
+    fl, keyring,
     liveness::{self, STALL_BEFORE_PROBE, STALL_WITHOUT_PROBE, Watch},
     login::{self, LoginResult},
     netwatch::{self, Change},
@@ -30,14 +30,15 @@ use cosmic::{
         window::{self, Id},
     },
     surface, theme,
-    widget::{button, checkbox, container, header_bar, icon, scrollable, text},
+    widget::{button, checkbox, container, header_bar, icon, scrollable, text, text_input},
 };
 use cosmic_applet_fortivpn::{
     CONFIGURE_NAME, LIBEXEC_DIR,
     certcheck::{self, CertCheck},
-    gateway::{CertDigest, Gateway},
+    gateway::CertDigest,
     openfortivpn::TunnelDetail,
-    protocol::{Event, UntrustedCert},
+    profile::{LoginMethod, Profile, ProfileId},
+    protocol::{Credentials, Event, Login, Request, UntrustedCert},
 };
 use std::{
     net::IpAddr,
@@ -56,6 +57,8 @@ const AUTO_RECONNECT: &str = "auto_reconnect";
 const CERT_DIALOG_SIZE: Size = Size::new(560.0, 520.0);
 /// The login dialog only points at the browser, so it stays small.
 const LOGIN_DIALOG_SIZE: Size = Size::new(440.0, 220.0);
+/// The password dialog: username, password, one-time code, "remember".
+const PASSWORD_DIALOG_SIZE: Size = Size::new(440.0, 460.0);
 
 /// How often the traffic counters are read while connected.
 const TRAFFIC_INTERVAL: Duration = Duration::from_secs(1);
@@ -76,12 +79,31 @@ pub fn run() -> cosmic::iced::Result {
 enum Dialog {
     Cert(UntrustedCert),
     Login,
+    Password,
+}
+
+/// The password dialog's fields.
+#[derive(Debug, Default)]
+struct PasswordForm {
+    username: String,
+    password: String,
+    otp: String,
+    remember: bool,
+    /// Why the entered credentials cannot be used.
+    error: Option<String>,
 }
 
 struct Agent {
     core: Core,
     status: Status,
-    gateway: Result<Option<Gateway>, String>,
+    /// The VPN accounts an admin set up.
+    profiles: Vec<Profile>,
+    /// Why some profiles could not be read.
+    profiles_error: Option<String>,
+    /// The profile of the current or last connection.
+    active: Option<ProfileId>,
+    /// Connect this profile once the current connection is down.
+    pending_connect: Option<ProfileId>,
     tunnel: Option<UnboundedSender<TunnelCommand>>,
     /// Publishes snapshots on the bus, once it is served.
     bus: Option<UnboundedSender<Snapshot>>,
@@ -123,6 +145,14 @@ struct Agent {
     connect_after_resume: bool,
     /// Numbers certificate checks, so a late result of a cancelled one is ignored.
     cert_checks: u64,
+    /// The gateway certificate's digest and the intermediate fetched through AIA that makes it
+    /// validate, for this attempt.
+    intermediate: Option<(CertDigest, Vec<u8>)>,
+    /// Credentials for this attempt of a password profile; taken when the helper starts.
+    credentials: Option<Credentials>,
+    /// The password dialog is up.
+    asking_password: bool,
+    password_form: PasswordForm,
 }
 
 /// What a status change meant for reconnecting.
@@ -151,6 +181,14 @@ enum Message {
     Drag(Id),
     /// Certificate check `id` finished.
     CertChecked(u64, Result<CertCheck, String>),
+    /// The keyring's answer for the active profile: the stored password, if any.
+    StoredPassword(Result<Option<String>, String>),
+    KeyringDone(Result<(), String>),
+    PasswordUsername(String),
+    PasswordInput(String),
+    OtpInput(String),
+    RememberPassword(bool),
+    SubmitPassword,
     LoginFinished(LoginResult),
     /// Time to read the traffic counters.
     TrafficTick,
@@ -187,7 +225,10 @@ impl cosmic::Application for Agent {
         let mut agent = Self {
             core,
             status: Status::Disconnected,
-            gateway: load_gateway(),
+            profiles: Vec::new(),
+            profiles_error: None,
+            active: None,
+            pending_connect: None,
             tunnel: None,
             bus: None,
             published: None,
@@ -213,7 +254,12 @@ impl cosmic::Application for Agent {
             reconnects: 0,
             connect_after_resume: false,
             cert_checks: 0,
+            intermediate: None,
+            credentials: None,
+            asking_password: false,
+            password_form: PasswordForm::default(),
         };
+        agent.load_profiles();
         match cosmic_config::Config::new(APP_ID, CONFIG_VERSION) {
             Ok(config) => {
                 agent.auto_reconnect = config.get(AUTO_RECONNECT).unwrap_or(false);
@@ -259,7 +305,7 @@ impl cosmic::Application for Agent {
                     self.notify_failure(&before, Some(fl!("notify-reconnect-failed")))
                 }
             };
-            follow_up = Task::batch([reconnect, notification]);
+            follow_up = Task::batch([reconnect, notification, self.after_status_change()]);
         }
         self.end_login_if_done();
         self.sync_sleep_lock();
@@ -276,6 +322,7 @@ impl cosmic::Application for Agent {
         match &self.dialog {
             Some((dialog_id, Dialog::Cert(cert))) if *dialog_id == id => self.cert_dialog(id, cert),
             Some((dialog_id, Dialog::Login)) if *dialog_id == id => self.login_dialog(id),
+            Some((dialog_id, Dialog::Password)) if *dialog_id == id => self.password_dialog(id),
             _ => text::body("").into(),
         }
     }
@@ -289,7 +336,7 @@ impl Agent {
             Message::Configured(result, connect_next) => {
                 tracing::info!(?result, connect_next, "configure helper finished");
                 self.configuring = false;
-                self.gateway = load_gateway();
+                self.load_profiles();
                 match result {
                     Ok(()) if connect_next => {
                         self.configure_error = None;
@@ -321,6 +368,11 @@ impl Agent {
                 }
                 let result = match result {
                     Ok(CertCheck::Trusted) => Ok(None),
+                    Ok(CertCheck::Completed { intermediate, leaf }) => {
+                        tracing::info!("certificate chain completed through AIA");
+                        self.intermediate = Some((leaf, intermediate));
+                        Ok(None)
+                    }
                     Ok(CertCheck::Untrusted(cert)) => Ok(Some(cert)),
                     Err(err) => {
                         tracing::warn!(%err, "could not check the gateway certificate");
@@ -330,6 +382,14 @@ impl Agent {
                 let effect = self.status.on_cert_checked(result);
                 return self.run(effect);
             }
+            Message::StoredPassword(result) => return self.on_stored_password(result),
+            Message::KeyringDone(Err(err)) => tracing::warn!(%err, "keyring"),
+            Message::KeyringDone(Ok(())) => {}
+            Message::PasswordUsername(value) => self.password_form.username = value,
+            Message::PasswordInput(value) => self.password_form.password = value,
+            Message::OtpInput(value) => self.password_form.otp = value,
+            Message::RememberPassword(checked) => self.password_form.remember = checked,
+            Message::SubmitPassword => return self.submit_password(),
             Message::LoginFinished(result) => {
                 self.login = None;
                 if let LoginResult::Failed(why) = &result {
@@ -390,10 +450,9 @@ impl Agent {
                 // Publish the current state to the newly served object.
                 self.published = None;
             }
-            BusUpdate::Command(AgentCommand::Connect) => {
+            BusUpdate::Command(AgentCommand::Connect(id)) => {
                 self.cancel_reconnect();
-                let effect = self.status.connect();
-                return self.run(effect);
+                return self.connect_profile(id);
             }
             BusUpdate::Command(AgentCommand::Disconnect) => {
                 self.cancel_reconnect();
@@ -403,12 +462,34 @@ impl Agent {
             BusUpdate::Command(AgentCommand::SetAutoReconnect(enabled)) => {
                 self.set_auto_reconnect(enabled);
             }
-            BusUpdate::Command(AgentCommand::ForgetCert) => {
-                return self.configure(vec!["forget-cert".into()], false);
+            BusUpdate::Command(AgentCommand::ForgetCert(id)) => {
+                return self.configure(vec!["forget-cert".into(), id.to_string()], false);
             }
-            BusUpdate::Command(AgentCommand::SetGateway(address)) => {
-                self.session_trust = None;
-                return self.configure(vec!["set-gateway".into(), address], false);
+            BusUpdate::Command(AgentCommand::SaveProfile {
+                id,
+                name,
+                method,
+                address,
+            }) => {
+                if self.active.as_ref() == Some(&id) {
+                    self.session_trust = None;
+                }
+                let args = vec![
+                    "save-profile".into(),
+                    id.to_string(),
+                    name,
+                    method.as_str().into(),
+                    address,
+                ];
+                return self.configure(args, false);
+            }
+            BusUpdate::Command(AgentCommand::RemoveProfile(id)) => {
+                let forget = cosmic::task::future({
+                    let id = id.clone();
+                    async move { Message::KeyringDone(keyring::forget(id).await) }
+                });
+                let remove = self.configure(vec!["remove-profile".into(), id.to_string()], false);
+                return Task::batch([remove, forget]);
             }
             BusUpdate::NameTaken => {
                 tracing::info!("another agent is running, exiting");
@@ -671,14 +752,7 @@ impl Agent {
         let Status::Failed(_) = &self.status else {
             return Task::none();
         };
-        let snapshot = Snapshot::new(
-            &self.status,
-            &self.gateway,
-            false,
-            None,
-            None,
-            Traffic::default(),
-        );
+        let snapshot = Snapshot::new(&self.status);
         let summary = summary.unwrap_or_else(|| {
             if matches!(before, Status::Connected { .. }) {
                 fl!("notify-disconnected")
@@ -706,6 +780,9 @@ impl Agent {
         if self.status != Status::WaitingForLogin {
             self.browser_login = false;
         }
+        if self.status != Status::LoggingIn {
+            self.asking_password = false;
+        }
     }
 
     /// Carries out what a state transition asks for.
@@ -724,7 +801,11 @@ impl Agent {
                 }
                 Task::none()
             }
-            Effect::Login => self.run_login(),
+            Effect::Login => match self.active_profile().map(|p| p.method) {
+                Some(LoginMethod::Password) => self.password_login(),
+                _ => self.run_login(),
+            },
+            Effect::StartHelper => self.start_helper(),
             Effect::DeliverSamlId(id) => {
                 cosmic::task::future(async move { Message::HandedOver(login::hand_over(id).await) })
             }
@@ -740,8 +821,10 @@ impl Agent {
     /// [`CERT_CHECK_TIMEOUT`].
     fn check_cert(&mut self) -> Task<cosmic::Action<Message>> {
         self.cert_checks += 1;
+        self.intermediate = None;
+        self.credentials = None;
         let id = self.cert_checks;
-        let Ok(Some(gateway)) = self.gateway.clone() else {
+        let Some(gateway) = self.active_profile().map(|p| p.gateway.clone()) else {
             // No gateway: let the helper report it.
             return cosmic::task::message(Message::CertChecked(id, Ok(CertCheck::Trusted)));
         };
@@ -757,12 +840,12 @@ impl Agent {
     }
 
     fn open_login_page(&self) -> Task<cosmic::Action<Message>> {
-        match &self.gateway {
-            Ok(Some(gateway)) => {
-                let url = gateway.saml_login_url();
+        match self.active_profile() {
+            Some(profile) => {
+                let url = profile.gateway.saml_login_url();
                 cosmic::task::future(async move { Message::LoginPageOpened(open_url(&url).await) })
             }
-            _ => Task::none(),
+            None => Task::none(),
         }
     }
 
@@ -771,12 +854,15 @@ impl Agent {
         let Status::CertUntrusted(cert) = &self.status else {
             return Task::none();
         };
+        let Some(profile) = self.active.clone() else {
+            return Task::none();
+        };
         let command = if self.always_trust {
             "trust-cert"
         } else {
             "trust-cert-once"
         };
-        let args = vec![command.into(), cert.digest.to_string()];
+        let args = vec![command.into(), profile.to_string(), cert.digest.to_string()];
         self.session_trust = Some(cert.digest.clone());
         self.configure(args, true)
     }
@@ -784,17 +870,21 @@ impl Agent {
     /// Runs the login window, before openfortivpn starts. Aborting the task kills it
     /// (`kill_on_drop`).
     fn run_login(&mut self) -> Task<cosmic::Action<Message>> {
-        let Ok(Some(gateway)) = &self.gateway else {
-            let why = "no gateway".to_owned();
+        let Some(profile) = self.active_profile() else {
+            let why = "no profile".to_owned();
             return cosmic::task::message(Message::LoginFinished(LoginResult::Failed(why)));
         };
+        // The window needs the same exception as openfortivpn for a gateway certificate that
+        // only validates with the fetched intermediate, or not at all.
         let trusted = self
             .session_trust
             .clone()
-            .or_else(|| gateway.trusted_cert.clone());
+            .or_else(|| profile.gateway.trusted_cert.clone())
+            .or_else(|| self.intermediate.as_ref().map(|(leaf, _)| leaf.clone()));
         let login = login::Login {
-            url: gateway.saml_login_url(),
-            host: gateway.host.clone(),
+            url: profile.gateway.saml_login_url(),
+            host: profile.gateway.host.clone(),
+            profile: profile.id.clone(),
             trusted,
         };
         let (task, handle) =
@@ -802,6 +892,202 @@ impl Agent {
                 .abortable();
         self.login = Some(handle);
         task
+    }
+
+    /// Reads the profiles an admin set up.
+    fn load_profiles(&mut self) {
+        let (profiles, errors) = Profile::load_all();
+        for err in &errors {
+            tracing::warn!(%err, "profile");
+        }
+        self.profiles = profiles;
+        self.profiles_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        // A removed active profile cannot be connected again.
+        if let Some(active) = &self.active
+            && !self.profiles.iter().any(|p| &p.id == active)
+            && !self.status.is_active()
+        {
+            self.active = None;
+        }
+    }
+
+    fn active_profile(&self) -> Option<&Profile> {
+        let active = self.active.as_ref()?;
+        self.profiles.iter().find(|p| &p.id == active)
+    }
+
+    fn active_host(&self) -> String {
+        self.active_profile()
+            .map(|p| p.gateway.host.clone())
+            .unwrap_or_default()
+    }
+
+    /// Connects `id`. Another profile's connection is taken down first.
+    fn connect_profile(&mut self, id: ProfileId) -> Task<cosmic::Action<Message>> {
+        if !self.profiles.iter().any(|p| p.id == id) {
+            tracing::warn!(%id, "no such profile");
+            return Task::none();
+        }
+        let busy =
+            self.status.is_active() || matches!(self.status, Status::Checking | Status::LoggingIn);
+        if busy {
+            if self.active.as_ref() == Some(&id) {
+                return Task::none();
+            }
+            tracing::info!(%id, "switching profiles");
+            self.pending_connect = Some(id);
+            let effect = self.status.disconnect();
+            return self.run(effect);
+        }
+        if self.active.as_ref() != Some(&id) {
+            // A certificate trusted once belonged to the other profile.
+            self.session_trust = None;
+            self.active = Some(id);
+        }
+        let effect = self.status.connect();
+        self.run(effect)
+    }
+
+    /// Follow-ups of a status change: a profile switch waiting for the disconnect, and a
+    /// rejected password that must not be used again.
+    fn after_status_change(&mut self) -> Task<cosmic::Action<Message>> {
+        let mut tasks = Vec::new();
+        if matches!(self.status, Status::Failed(Failure::AuthFailed))
+            && let Some(profile) = self.active_profile()
+            && profile.method == LoginMethod::Password
+        {
+            tracing::info!("login rejected, forgetting the stored password");
+            let id = profile.id.clone();
+            tasks.push(cosmic::task::future(async move {
+                Message::KeyringDone(keyring::forget(id).await)
+            }));
+        }
+        let idle = !self.status.is_active()
+            && !matches!(self.status, Status::Checking | Status::LoggingIn);
+        if idle && let Some(id) = self.pending_connect.take() {
+            tasks.push(self.connect_profile(id));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Starts the helper for the active profile with this attempt's login.
+    fn start_helper(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(profile) = self.active.clone() else {
+            return Task::none();
+        };
+        let login = match self.credentials.take() {
+            Some(credentials) => Login::Password(credentials),
+            None => Login::Saml,
+        };
+        let request = Request {
+            profile,
+            login,
+            intermediate: self.intermediate.as_ref().map(|(_, der)| der.clone()),
+        };
+        self.run(Effect::Send(TunnelCommand::Connect(request)))
+    }
+
+    /// Logs in a password profile: with the stored password if there is one and no one-time
+    /// code was needed last time, otherwise through the password dialog.
+    fn password_login(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(id) = self.active.clone() else {
+            return Task::none();
+        };
+        let username = self.user_setting(&id, "username").unwrap_or_default();
+        let uses_otp = self.user_setting(&id, "otp").is_some_and(|v| v == "true");
+        self.password_form = PasswordForm {
+            username: username.clone(),
+            remember: true,
+            ..PasswordForm::default()
+        };
+        if username.is_empty() || uses_otp {
+            self.asking_password = true;
+            return Task::none();
+        }
+        cosmic::task::future(
+            async move { Message::StoredPassword(keyring::load(id, username).await) },
+        )
+    }
+
+    fn on_stored_password(
+        &mut self,
+        result: Result<Option<String>, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        if self.status != Status::LoggingIn {
+            return Task::none();
+        }
+        match result {
+            Ok(Some(password)) => {
+                let credentials = Credentials {
+                    username: self.password_form.username.clone(),
+                    password,
+                    otp: None,
+                };
+                if credentials.check().is_ok() {
+                    self.credentials = Some(credentials);
+                    let effect = self.status.on_login(LoginResult::Password);
+                    return self.run(effect);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(%err, "could not read the keyring"),
+        }
+        self.asking_password = true;
+        Task::none()
+    }
+
+    /// Takes the credentials from the dialog, remembers what was asked for, and logs in.
+    fn submit_password(&mut self) -> Task<cosmic::Action<Message>> {
+        let (Some(profile), Status::LoggingIn) = (self.active_profile().cloned(), &self.status)
+        else {
+            return Task::none();
+        };
+        let form = &self.password_form;
+        let otp = form.otp.trim();
+        let credentials = Credentials {
+            username: form.username.trim().to_owned(),
+            password: form.password.clone(),
+            otp: (!otp.is_empty()).then(|| otp.to_owned()),
+        };
+        if credentials.check().is_err() {
+            self.password_form.error = Some(fl!("password-invalid"));
+            return Task::none();
+        }
+        self.set_user_setting(&profile.id, "username", &credentials.username);
+        let otp_used = if credentials.otp.is_some() {
+            "true"
+        } else {
+            "false"
+        };
+        self.set_user_setting(&profile.id, "otp", otp_used);
+        let keyring_task = if form.remember {
+            let (id, name) = (profile.id.clone(), profile.name.clone());
+            let (user, password) = (credentials.username.clone(), credentials.password.clone());
+            cosmic::task::future(async move {
+                Message::KeyringDone(keyring::store(id, name, user, password).await)
+            })
+        } else {
+            let id = profile.id.clone();
+            cosmic::task::future(async move { Message::KeyringDone(keyring::forget(id).await) })
+        };
+        self.password_form = PasswordForm::default();
+        self.asking_password = false;
+        self.credentials = Some(credentials);
+        let effect = self.status.on_login(LoginResult::Password);
+        Task::batch([keyring_task, self.run(effect)])
+    }
+
+    /// A per-user, per-profile setting (cosmic-config key `<name>-<profile>`).
+    fn user_setting(&self, id: &ProfileId, name: &str) -> Option<String> {
+        self.config.as_ref()?.get(&format!("{name}-{id}")).ok()
+    }
+
+    fn set_user_setting(&self, id: &ProfileId, name: &str, value: &str) {
+        if let Some(config) = &self.config
+            && let Err(err) = config.set(&format!("{name}-{id}"), value)
+        {
+            tracing::warn!(%err, "could not save the settings");
+        }
     }
 
     /// Runs the configure helper through pkexec, which asks for the admin password.
@@ -819,15 +1105,15 @@ impl Agent {
 
     /// Sends the current state to the bus if it changed.
     fn publish(&mut self) {
-        let snapshot = Snapshot::new(
-            &self.status,
-            &self.gateway,
-            self.configuring,
-            self.configure_error.as_deref(),
-            self.address.as_deref(),
-            self.traffic,
-        )
-        .with_reconnect(self.reconnect.is_some(), self.auto_reconnect);
+        let snapshot = Snapshot::new(&self.status)
+            .with_profiles(
+                &self.profiles,
+                self.profiles_error.as_deref(),
+                self.active.as_ref(),
+            )
+            .with_configure(self.configuring, self.configure_error.as_deref())
+            .with_tunnel(self.address.as_deref(), self.traffic)
+            .with_reconnect(self.reconnect.is_some(), self.auto_reconnect);
         if self.published.as_ref() == Some(&snapshot) {
             return;
         }
@@ -844,6 +1130,7 @@ impl Agent {
             Status::CertUntrusted(cert) => Some(Dialog::Cert(cert.clone())),
             // The login window speaks for itself; the dialog only points at the browser.
             Status::WaitingForLogin if self.browser_login => Some(Dialog::Login),
+            Status::LoggingIn if self.asking_password => Some(Dialog::Password),
             _ => None,
         };
         if self.dialog.as_ref().map(|(_, dialog)| dialog) == wanted.as_ref() {
@@ -862,6 +1149,7 @@ impl Agent {
         let (title, size) = match &dialog {
             Dialog::Cert(_) => (fl!("cert-untrusted-title"), CERT_DIALOG_SIZE),
             Dialog::Login => (fl!("login-dialog-title"), LOGIN_DIALOG_SIZE),
+            Dialog::Password => (fl!("password-dialog-title"), PASSWORD_DIALOG_SIZE),
         };
         let settings = window::Settings {
             size,
@@ -895,10 +1183,7 @@ impl Agent {
     /// Asks whether to trust a certificate that does not validate.
     fn cert_dialog(&self, id: Id, cert: &UntrustedCert) -> Element<'_, Message> {
         let spacing = theme::active().cosmic().spacing;
-        let host = match &self.gateway {
-            Ok(Some(gateway)) => gateway.host.clone(),
-            _ => String::new(),
-        };
+        let host = self.active_host();
         let field =
             |label: String, value: String| column![text::caption_heading(label), text::body(value)];
         let mut details = column![
@@ -935,10 +1220,7 @@ impl Agent {
 
     /// Tells the user to log in in the browser; closes itself once the login arrived.
     fn login_dialog(&self, id: Id) -> Element<'_, Message> {
-        let host = match &self.gateway {
-            Ok(Some(gateway)) => gateway.host.clone(),
-            _ => String::new(),
-        };
+        let host = self.active_host();
         dialog_layout(
             id,
             "network-vpn-acquiring-symbolic",
@@ -950,6 +1232,55 @@ impl Agent {
                     .into(),
                 button::suggested(fl!("open-login-page"))
                     .on_press(Message::OpenLoginPage)
+                    .into(),
+            ],
+        )
+    }
+}
+
+impl Agent {
+    /// Asks for the password (and one-time code) of a password profile.
+    fn password_dialog(&self, id: Id) -> Element<'_, Message> {
+        let spacing = theme::active().cosmic().spacing;
+        let form = &self.password_form;
+        let name = self
+            .active_profile()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let mut fields = column![
+            text::body(fl!("password-dialog-body", name = name)),
+            text_input(fl!("username"), &form.username)
+                .label(fl!("username"))
+                .on_input(Message::PasswordUsername)
+                .on_submit(|_| Message::SubmitPassword),
+            text_input(fl!("password"), &form.password)
+                .label(fl!("password"))
+                .password()
+                .on_input(Message::PasswordInput)
+                .on_submit(|_| Message::SubmitPassword),
+            text_input(fl!("otp-placeholder"), &form.otp)
+                .label(fl!("otp"))
+                .on_input(Message::OtpInput)
+                .on_submit(|_| Message::SubmitPassword),
+            checkbox(form.remember)
+                .label(fl!("remember-password"))
+                .on_toggle(Message::RememberPassword),
+        ]
+        .spacing(spacing.space_s);
+        if let Some(err) = &form.error {
+            fields = fields.push(text::body(err.clone()));
+        }
+        dialog_layout(
+            id,
+            "dialog-password-symbolic",
+            fl!("password-dialog-title"),
+            fields.into(),
+            vec![
+                button::standard(fl!("cancel"))
+                    .on_press(Message::Cancel)
+                    .into(),
+                button::suggested(fl!("connect"))
+                    .on_press(Message::SubmitPassword)
                     .into(),
             ],
         )
@@ -1029,10 +1360,6 @@ fn group_digest(digest: &str) -> String {
         .map(|line| line.join(" "))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn load_gateway() -> Result<Option<Gateway>, String> {
-    Gateway::load().map_err(|err| err.to_string())
 }
 
 /// Opens a URL in the default browser.

@@ -2,20 +2,23 @@
 
 //! Runs openfortivpn as root on behalf of the applet. Started by the applet through pkexec.
 //!
-//! Reads one request line from stdin (the only input taken from the caller), runs openfortivpn
-//! against the gateway in the root-owned config, and reports events on stdout. When stdin
+//! Reads one request line from stdin (the only input taken from the caller: a profile id, the
+//! login, maybe an intermediate certificate), runs openfortivpn against that root-owned
+//! profile, and reports events on stdout. When stdin
 //! closes, because the applet disconnects or exits, openfortivpn is stopped with SIGTERM so it
 //! can restore routes and DNS. Its last step, logging out at the gateway, can hang when the
 //! network is gone; once the rest is done it gets [`LOGOUT_GRACE`], then SIGKILL.
 //!
 //! This runs as root: it must not panic, and it never passes caller input to openfortivpn
-//! other than the validated cookie.
+//! other than validated credentials. An intermediate certificate from the caller is only used
+//! after the helper validated the gateway's chain with it against the system roots itself.
 
 use cosmic_applet_fortivpn::{
-    RUN_DIR, SESSION_TRUST_PATH,
+    RUN_DIR, SESSION_TRUST_PATH, certcheck,
     gateway::{CertDigest, Gateway},
     openfortivpn::{self, OutputParser},
-    protocol::{Event, HelperError, Request},
+    profile::{LoginMethod, Profile, ProfileId},
+    protocol::{Credentials, Event, HelperError, Login, Request},
 };
 use rustix::{
     fs::{FlockOperation, flock},
@@ -26,13 +29,13 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, ExitCode, Stdio},
+    process::{Child, Command, ExitCode, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
-/// Upper bound for the request line; a cookie is at most 4000 bytes.
+/// Upper bound for the request line: credentials, and an intermediate certificate in hex.
 const MAX_REQUEST_LEN: u64 = 8192;
 
 /// How long openfortivpn may take to log out at the gateway after it restored routes and DNS.
@@ -89,21 +92,32 @@ fn run(events: &mut Events) -> Result<Option<i32>, HelperError> {
             "must run as root, through pkexec".into(),
         ));
     }
-    let gateway = match Gateway::load() {
-        Ok(Some(gateway)) => gateway,
-        Ok(None) => return Err(HelperError::NotConfigured),
-        Err(err) => return Err(HelperError::Failed(format!("gateway config: {err}"))),
-    };
-
     let mut stdin = BufReader::new(io::stdin());
     let request = read_request(&mut stdin)?;
+    let profile = match Profile::load(&request.profile) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return Err(HelperError::NotConfigured),
+        Err(err) => {
+            return Err(HelperError::Failed(format!(
+                "profile {}: {err}",
+                request.profile
+            )));
+        }
+    };
+    let credentials = match (&request.login, profile.method) {
+        (Login::Saml, LoginMethod::Saml) => None,
+        (Login::Password(credentials), LoginMethod::Password) => Some(credentials),
+        // The profile, set up by an admin, decides how it logs in.
+        _ => return Err(HelperError::BadRequest),
+    };
 
     let _lock = lock()?;
-    let config = ConfigFile::write(&gateway)?;
-    let mut child = spawn(&config.path, &request)?;
-    if let Request::Cookie(cookie) = &request {
-        send_cookie(child.stdin.take(), cookie)?;
+    let mut trusted: Vec<CertDigest> = read_session_trust(&profile.id).into_iter().collect();
+    if let Some(intermediate) = &request.intermediate {
+        trusted.extend(verify_intermediate(&profile.gateway, intermediate, events));
     }
+    let config = ConfigFile::write(&profile.gateway, &trusted, credentials)?;
+    let mut child = spawn(&config.path, &request.login)?;
 
     let (tx, rx) = mpsc::channel();
     forward_lines(child.stdout.take(), tx.clone());
@@ -151,17 +165,44 @@ fn lock() -> Result<File, HelperError> {
     }
 }
 
+/// Validates the gateway's chain with the caller's intermediate against the system roots, and
+/// if it holds, returns the gateway certificate's digest to trust for this connection.
+fn verify_intermediate(
+    gateway: &Gateway,
+    intermediate: &[u8],
+    events: &mut Events,
+) -> Option<CertDigest> {
+    match certcheck::verify_with_intermediate(gateway, intermediate) {
+        Ok(Some(digest)) => {
+            events.send(&Event::Log("certificate chain completed".into()));
+            Some(digest)
+        }
+        Ok(None) => {
+            events.send(&Event::Log("intermediate certificate not used".into()));
+            None
+        }
+        Err(err) => {
+            events.send(&Event::Log(format!("intermediate certificate: {err}")));
+            None
+        }
+    }
+}
+
 /// openfortivpn's config file, removed again on drop together with the session trust,
-/// which is valid for this one connection.
+/// which is valid for this one connection. Holds the password for a password login: it lives
+/// in the root-only runtime directory, and only while the connection runs.
 struct ConfigFile {
     path: PathBuf,
 }
 
 impl ConfigFile {
-    fn write(gateway: &Gateway) -> Result<Self, HelperError> {
+    fn write(
+        gateway: &Gateway,
+        trusted: &[CertDigest],
+        credentials: Option<&Credentials>,
+    ) -> Result<Self, HelperError> {
         let path = Path::new(RUN_DIR).join("openfortivpn.conf");
-        let session_trust = read_session_trust();
-        let text = openfortivpn::config_file(gateway, session_trust.as_ref());
+        let text = openfortivpn::config_file(gateway, trusted, credentials);
         OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -181,39 +222,34 @@ impl Drop for ConfigFile {
     }
 }
 
-/// The certificate an admin trusted for this connection only, if any. Written by
-/// `configure trust-cert-once`; an unreadable or invalid file trusts nothing.
-fn read_session_trust() -> Option<CertDigest> {
-    fs::read_to_string(SESSION_TRUST_PATH).ok()?.parse().ok()
+/// The certificate an admin trusted for this profile's next connection only, if any. Written
+/// by `configure trust-cert-once` as `<profile> <digest>`; an unreadable or invalid file, or
+/// one for another profile, trusts nothing.
+fn read_session_trust(profile: &ProfileId) -> Option<CertDigest> {
+    parse_session_trust(&fs::read_to_string(SESSION_TRUST_PATH).ok()?, profile)
 }
 
-/// Starts openfortivpn with our config file and a clean environment.
-fn spawn(config: &Path, request: &Request) -> Result<Child, HelperError> {
-    let (login_arg, stdin) = match request {
-        Request::SamlLogin => ("--saml-login", Stdio::null()),
-        Request::Cookie(_) => ("--cookie-on-stdin", Stdio::piped()),
-    };
-    Command::new(openfortivpn::OPENFORTIVPN)
-        .arg("-c")
-        .arg(config)
-        .arg(login_arg)
+fn parse_session_trust(text: &str, profile: &ProfileId) -> Option<CertDigest> {
+    let (id, digest) = text.trim().split_once(' ')?;
+    (id == profile.as_str()).then(|| digest.parse().ok())?
+}
+
+/// Starts openfortivpn with our config file and a clean environment. A password login needs
+/// no option: the credentials are in the config file.
+fn spawn(config: &Path, login: &Login) -> Result<Child, HelperError> {
+    let mut command = Command::new(openfortivpn::OPENFORTIVPN);
+    command.arg("-c").arg(config);
+    if let Login::Saml = login {
+        command.arg("--saml-login");
+    }
+    command
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin")
-        .stdin(stdin)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| HelperError::Failed(format!("{}: {err}", openfortivpn::OPENFORTIVPN)))
-}
-
-/// Writes the cookie in one write and closes the pipe. openfortivpn reads it with a single
-/// `read()` and keeps any trailing newline, so none is sent. Writes of up to 4096 bytes to a
-/// pipe are atomic, and cookies are at most 4000.
-fn send_cookie(stdin: Option<ChildStdin>, cookie: &str) -> Result<(), HelperError> {
-    let mut stdin = stdin.ok_or_else(|| HelperError::Failed("no stdin for openfortivpn".into()))?;
-    stdin
-        .write_all(cookie.as_bytes())
-        .map_err(|err| HelperError::Failed(format!("sending the cookie: {err}")))
 }
 
 /// Forwards lines from one of openfortivpn's output streams until it closes.
@@ -366,11 +402,38 @@ mod tests {
     }
 
     #[test]
+    fn session_trust_only_for_its_profile() {
+        const DIGEST: &str = "f2c935968edba48ab89c19f4291cf5449efc814665d179e32023f519dc89f1a1";
+        let ace: ProfileId = "ace".parse().unwrap();
+        let other: ProfileId = "other".parse().unwrap();
+        let text = format!("ace {DIGEST}\n");
+        assert_eq!(
+            parse_session_trust(&text, &ace).map(|d| d.to_string()),
+            Some(DIGEST.to_owned())
+        );
+        assert_eq!(parse_session_trust(&text, &other), None);
+        assert_eq!(
+            parse_session_trust(DIGEST, &ace),
+            None,
+            "old format trusts nothing"
+        );
+        assert_eq!(parse_session_trust("ace nothex", &ace), None);
+    }
+
+    #[test]
     fn request_line_must_be_complete_and_valid() {
         let read = |input: &str| read_request(&mut BufReader::new(input.as_bytes()));
-        assert_eq!(read("saml-login\n"), Ok(Request::SamlLogin));
-        assert_eq!(read("cookie abc\nrest"), Ok(Request::Cookie("abc".into())));
-        assert_eq!(read("saml-login"), Err(HelperError::BadRequest));
+        let saml = Request {
+            profile: "ace".parse().unwrap(),
+            login: Login::Saml,
+            intermediate: None,
+        };
+        assert_eq!(read("saml-login\tprofile=ace\n"), Ok(saml.clone()));
+        assert_eq!(read("saml-login\tprofile=ace\nrest"), Ok(saml));
+        assert_eq!(
+            read("saml-login\tprofile=ace"),
+            Err(HelperError::BadRequest)
+        );
         assert_eq!(read(""), Err(HelperError::BadRequest));
         assert_eq!(read("-c /tmp/x\n"), Err(HelperError::BadRequest));
         let endless = "a".repeat(MAX_REQUEST_LEN as usize + 10);

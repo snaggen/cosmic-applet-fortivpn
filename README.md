@@ -3,8 +3,9 @@
 A COSMIC panel applet for a Fortinet SSL VPN with SAML/SSO login, built on
 [openfortivpn](https://github.com/adrienverge/openfortivpn).
 
-**Status:** connects and disconnects with SAML login. Statistics and suspend handling are
-still to come.
+**Status:** several VPN accounts, SAML or password login (password in the keyring if wanted),
+traffic statistics, dead-tunnel detection, clean disconnect before sleep, optional
+reconnecting. Password login is untested against a real gateway.
 
 Requires `openfortivpn` (at `/usr/bin/openfortivpn`), polkit and WebKitGTK 4.1 (building needs
 `webkit2gtk4.1-devel` on Fedora).
@@ -20,10 +21,17 @@ agent then starts openfortivpn and hands it the session id, since openfortivpn w
 seconds for a login. Without the window the system browser is used. The agent opens a window in
 front of the user when they must act: to trust a certificate or to log in in the browser.
 
-openfortivpn needs root, so the agent starts `cosmic-applet-fortivpn-helper` through pkexec. The helper takes only the login from the
-applet; the gateway and the trusted certificate come from `/etc/cosmic-applet-fortivpn/`,
+openfortivpn needs root, so the agent starts `cosmic-applet-fortivpn-helper` through pkexec.
+The helper takes only a profile id and the login from the agent; the profiles (name, login
+method, gateway, trusted certificate) are files in `/etc/cosmic-applet-fortivpn/profiles/`,
 which only `cosmic-applet-fortivpn-configure` writes, and polkit requires an admin password
-for that. Closing the helper's stdin disconnects.
+for that. openfortivpn's own config is never read or written: the helper passes a generated
+file with `-c`. Closing the helper's stdin disconnects.
+
+A gateway that leaves out its intermediate certificate is handled without a prompt: the
+agent fetches the intermediate from the certificate's AIA address, and the helper checks the
+completed chain against the system roots itself before trusting the certificate for that
+connection. Otherwise the user is asked once per certificate.
 
 ## Build and install
 

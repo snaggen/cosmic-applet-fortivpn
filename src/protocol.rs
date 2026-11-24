@@ -6,35 +6,77 @@
 //! it disconnects. The helper writes one [`Event`] per line to stdout, fields separated by tabs.
 //!
 //! ```
-//! use cosmic_applet_fortivpn::protocol::{Event, Request};
+//! use cosmic_applet_fortivpn::protocol::Event;
 //!
-//! assert_eq!(Request::parse("saml-login"), Ok(Request::SamlLogin));
 //! assert_eq!(Event::parse(&Event::Up.to_line()), Some(Event::Up));
 //! ```
 
-use crate::gateway::CertDigest;
+use crate::{gateway::CertDigest, profile::ProfileId};
 use std::fmt;
 
-/// Longest cookie accepted. openfortivpn reads the cookie with a single `read()` of at most
-/// 4096 bytes, so a longer one would be cut off.
-pub const MAX_COOKIE_LEN: usize = 4000;
+/// Longest username and password accepted, in bytes: openfortivpn's own limits
+/// (`USERNAME_SIZE`, `PASSWORD_SIZE`), beyond which it would cut them off.
+const MAX_USERNAME_LEN: usize = 64;
+const MAX_PASSWORD_LEN: usize = 256;
+/// Longest one-time code accepted.
+const MAX_OTP_LEN: usize = 16;
+/// Largest intermediate certificate accepted (DER).
+pub const MAX_INTERMEDIATE_LEN: usize = 3000;
 
-/// How the helper should log in. The only input the helper takes from the applet.
+/// What the helper should do. The only input the helper takes from the agent: which profile
+/// (an admin set up everything else about it), the login, and maybe a certificate the agent
+/// fetched to complete the gateway's chain, which the helper verifies itself.
+///
+/// One line: the login kind, then tab-separated `key=value` fields.
+///
+/// ```
+/// use cosmic_applet_fortivpn::protocol::{Login, Request};
+///
+/// let request = Request {
+///     profile: "ace".parse().unwrap(),
+///     login: Login::Saml,
+///     intermediate: None,
+/// };
+/// assert_eq!(request.to_line(), "saml-login\tprofile=ace\n");
+/// assert_eq!(Request::parse("saml-login\tprofile=ace"), Ok(request));
+/// ```
 #[derive(Clone, PartialEq, Eq)]
-pub enum Request {
-    /// Let openfortivpn receive the SAML redirect on `127.0.0.1:8020` (`--saml-login`).
-    SamlLogin,
-    /// Use an `SVPNCOOKIE` obtained elsewhere (`--cookie-on-stdin`).
-    Cookie(String),
+pub struct Request {
+    pub profile: ProfileId,
+    pub login: Login,
+    /// The intermediate certificate the gateway does not send (DER), fetched through AIA.
+    pub intermediate: Option<Vec<u8>>,
 }
 
-/// Never shows the cookie, so a request can be logged safely.
+/// How to log in.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Login {
+    /// Let openfortivpn receive the SAML redirect on `127.0.0.1:8020` (`--saml-login`).
+    Saml,
+    /// Username and password, written to openfortivpn's root-only config file.
+    Password(Credentials),
+}
+
+/// A username and password, maybe with a one-time code.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+    pub otp: Option<String>,
+}
+
+/// Never shows the password or code, so a request can be logged safely.
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SamlLogin => write!(f, "SamlLogin"),
-            Self::Cookie(_) => write!(f, "Cookie(<redacted>)"),
-        }
+        let login = match &self.login {
+            Login::Saml => "Saml",
+            Login::Password(_) => "Password(<redacted>)",
+        };
+        f.debug_struct("Request")
+            .field("profile", &self.profile)
+            .field("login", &format_args!("{login}"))
+            .field("intermediate", &self.intermediate.as_ref().map(Vec::len))
+            .finish()
     }
 }
 
@@ -42,44 +84,136 @@ impl fmt::Debug for Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestError {
     Unknown,
-    InvalidCookie,
+    /// A field is missing, repeated, unknown or invalid; names the key.
+    Field(&'static str),
 }
 
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unknown => write!(f, "unknown request"),
-            Self::InvalidCookie => write!(f, "invalid cookie"),
+            Self::Field(key) => write!(f, "invalid request field {key}"),
         }
+    }
+}
+
+impl Credentials {
+    /// Whether the credentials can be sent: no control characters (they would end a field or
+    /// a config line), no surrounding spaces (openfortivpn's config parser drops them), bounded
+    /// length, and a code of digits and letters only.
+    pub fn check(&self) -> Result<(), RequestError> {
+        if !is_valid_credential(&self.username, MAX_USERNAME_LEN) {
+            return Err(RequestError::Field("user"));
+        }
+        if !is_valid_credential(&self.password, MAX_PASSWORD_LEN) {
+            return Err(RequestError::Field("pass"));
+        }
+        if let Some(otp) = &self.otp
+            && !is_valid_otp(otp)
+        {
+            return Err(RequestError::Field("otp"));
+        }
+        Ok(())
     }
 }
 
 impl Request {
     /// Parses a request line (without the newline).
     pub fn parse(line: &str) -> Result<Self, RequestError> {
-        match line.split_once(' ') {
-            None if line == "saml-login" => Ok(Self::SamlLogin),
-            Some(("cookie", cookie)) if is_valid_cookie(cookie) => Ok(Self::Cookie(cookie.into())),
-            Some(("cookie", _)) => Err(RequestError::InvalidCookie),
-            _ => Err(RequestError::Unknown),
+        let mut fields = line.split('\t');
+        let kind = fields.next().unwrap_or_default();
+        let (mut profile, mut user, mut pass, mut otp, mut ca) = (None, None, None, None, None);
+        for field in fields {
+            let (key, value) = field.split_once('=').ok_or(RequestError::Unknown)?;
+            let slot = match key {
+                "profile" => &mut profile,
+                "user" => &mut user,
+                "pass" => &mut pass,
+                "otp" => &mut otp,
+                "ca" => &mut ca,
+                _ => return Err(RequestError::Unknown),
+            };
+            if slot.replace(value).is_some() {
+                return Err(RequestError::Unknown);
+            }
         }
+        let profile = profile
+            .ok_or(RequestError::Field("profile"))?
+            .parse()
+            .map_err(|_| RequestError::Field("profile"))?;
+        let intermediate = ca
+            .map(|hex| {
+                decode_hex(hex).filter(|der| (1..=MAX_INTERMEDIATE_LEN).contains(&der.len()))
+            })
+            .map(|der| der.ok_or(RequestError::Field("ca")))
+            .transpose()?;
+        let login = match kind {
+            "saml-login" if user.is_none() && pass.is_none() && otp.is_none() => Login::Saml,
+            "password" => {
+                let credentials = Credentials {
+                    username: user.ok_or(RequestError::Field("user"))?.to_owned(),
+                    password: pass.ok_or(RequestError::Field("pass"))?.to_owned(),
+                    otp: otp.map(str::to_owned),
+                };
+                credentials.check()?;
+                Login::Password(credentials)
+            }
+            _ => return Err(RequestError::Unknown),
+        };
+        Ok(Self {
+            profile,
+            login,
+            intermediate,
+        })
     }
 
-    /// Formats the request line, newline included.
+    /// Formats the request line, newline included. Credentials must have passed
+    /// [`Credentials::check`].
     pub fn to_line(&self) -> String {
-        match self {
-            Self::SamlLogin => "saml-login\n".into(),
-            Self::Cookie(cookie) => format!("cookie {cookie}\n"),
+        let mut line = match &self.login {
+            Login::Saml => format!("saml-login\tprofile={}", self.profile),
+            Login::Password(c) => {
+                let mut line = format!(
+                    "password\tprofile={}\tuser={}\tpass={}",
+                    self.profile, c.username, c.password
+                );
+                if let Some(otp) = &c.otp {
+                    line.push_str(&format!("\totp={otp}"));
+                }
+                line
+            }
+        };
+        if let Some(der) = &self.intermediate {
+            line.push_str("\tca=");
+            line.push_str(&encode_hex(der));
         }
+        line.push('\n');
+        line
     }
 }
 
-/// Printable ASCII without whitespace or characters that would end the cookie in a header.
-fn is_valid_cookie(cookie: &str) -> bool {
-    (1..=MAX_COOKIE_LEN).contains(&cookie.len())
-        && cookie
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !matches!(b, b';' | b',' | b'"' | b'\\'))
+fn is_valid_credential(value: &str, max_len: usize) -> bool {
+    (1..=max_len).contains(&value.len())
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn is_valid_otp(otp: &str) -> bool {
+    (1..=MAX_OTP_LEN).contains(&otp.len()) && otp.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }
 
 /// The gateway certificate openfortivpn refused, for the user to decide on.
@@ -204,9 +338,31 @@ mod tests {
 
     const DIGEST: &str = "f2c935968edba48ab89c19f4291cf5449efc814665d179e32023f519dc89f1a1";
 
+    fn profile() -> ProfileId {
+        "ace".parse().unwrap()
+    }
+
+    fn password(otp: Option<&str>) -> Login {
+        Login::Password(Credentials {
+            username: "anna@example.com".into(),
+            password: "p=ss wörd#1".into(),
+            otp: otp.map(str::to_owned),
+        })
+    }
+
     #[test]
     fn request_round_trips() {
-        for request in [Request::SamlLogin, Request::Cookie("abc+/=123".into())] {
+        for (login, intermediate) in [
+            (Login::Saml, None),
+            (Login::Saml, Some(vec![0x30, 0x82, 0xff])),
+            (password(None), None),
+            (password(Some("123456")), Some(vec![1, 2, 3])),
+        ] {
+            let request = Request {
+                profile: profile(),
+                login,
+                intermediate,
+            };
             let line = request.to_line();
             assert_eq!(Request::parse(line.trim_end_matches('\n')), Ok(request));
         }
@@ -214,31 +370,55 @@ mod tests {
 
     #[test]
     fn request_rejects_bad_input() {
-        assert_eq!(Request::parse(""), Err(RequestError::Unknown));
-        assert_eq!(Request::parse("saml-login x"), Err(RequestError::Unknown));
-        assert_eq!(
-            Request::parse("--pppd-plugin x"),
-            Err(RequestError::Unknown)
+        let bad = |line: &str| Request::parse(line).is_err();
+        assert!(bad(""));
+        assert!(bad("saml-login"), "profile is required");
+        assert!(bad("saml-login\tprofile=../x"));
+        assert!(
+            bad("saml-login\tprofile=ace\tprofile=ace"),
+            "repeated field"
         );
-        assert_eq!(Request::parse("cookie "), Err(RequestError::InvalidCookie));
-        assert_eq!(
-            Request::parse("cookie a b"),
-            Err(RequestError::InvalidCookie)
+        assert!(
+            bad("saml-login\tprofile=ace\tpppd-plugin=x"),
+            "unknown field"
         );
-        assert_eq!(
-            Request::parse("cookie a;b"),
-            Err(RequestError::InvalidCookie)
+        assert!(
+            bad("saml-login\tprofile=ace\tpass=x"),
+            "no password for SAML"
         );
-        let too_long = format!("cookie {}", "a".repeat(MAX_COOKIE_LEN + 1));
-        assert_eq!(Request::parse(&too_long), Err(RequestError::InvalidCookie));
-        let longest = format!("cookie {}", "a".repeat(MAX_COOKIE_LEN));
-        assert!(Request::parse(&longest).is_ok());
+        assert!(bad("cookie\tprofile=ace"));
+        assert!(bad("--pppd-plugin x"));
+        assert!(bad("password\tprofile=ace\tuser=a"), "password is required");
+        assert!(
+            bad("password\tprofile=ace\tuser=a\tpass= x"),
+            "surrounding space"
+        );
+        assert!(bad("password\tprofile=ace\tuser=a\tpass=x\totp=12 34"));
+        assert!(bad(
+            "password\tprofile=ace\tuser=a\tpass=x\totp=12345678901234567"
+        ));
+        let long = "a".repeat(MAX_PASSWORD_LEN + 1);
+        assert!(bad(&format!("password\tprofile=ace\tuser=a\tpass={long}")));
+        let long = "a".repeat(MAX_USERNAME_LEN + 1);
+        assert!(bad(&format!("password\tprofile=ace\tuser={long}\tpass=x")));
+        assert!(bad("saml-login\tprofile=ace\tca=abc"), "odd hex");
+        assert!(bad("saml-login\tprofile=ace\tca=zz"), "not hex");
+        assert!(bad("saml-login\tprofile=ace\tca="), "empty certificate");
+        let huge = "00".repeat(MAX_INTERMEDIATE_LEN + 1);
+        assert!(bad(&format!("saml-login\tprofile=ace\tca={huge}")));
     }
 
     #[test]
-    fn request_debug_hides_cookie() {
-        let debug = format!("{:?}", Request::Cookie("secret".into()));
-        assert!(!debug.contains("secret"));
+    fn request_debug_hides_secrets() {
+        let request = Request {
+            profile: profile(),
+            login: password(Some("987654")),
+            intermediate: None,
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("wörd"));
+        assert!(!debug.contains("987654"));
+        assert!(debug.contains("ace"));
     }
 
     #[test]

@@ -11,23 +11,37 @@
 
 use crate::{
     gateway::{CertDigest, Gateway},
-    protocol::{Event, UntrustedCert},
+    protocol::{Credentials, Event, UntrustedCert},
 };
 
 /// Path of the openfortivpn binary. Absolute, since the helper runs with a cleared PATH.
 pub const OPENFORTIVPN: &str = "/usr/bin/openfortivpn";
 
 /// The config file passed with `-c`. Passing our own file keeps openfortivpn from reading
-/// `/etc/openfortivpn/config`, so nothing but the gateway config decides how it runs.
-/// `session_trust` is a certificate trusted for this connection only; openfortivpn accepts
-/// several `trusted-cert` lines.
-pub fn config_file(gateway: &Gateway, session_trust: Option<&CertDigest>) -> String {
+/// `/etc/openfortivpn/config`, so nothing but the profile decides how it runs.
+/// `session_trust` are certificates trusted for this connection only; openfortivpn accepts
+/// several `trusted-cert` lines. `credentials` must have passed [`Credentials::check`]: no
+/// line breaks, no surrounding spaces (openfortivpn splits at the first `=` and trims).
+pub fn config_file(
+    gateway: &Gateway,
+    session_trust: &[CertDigest],
+    credentials: Option<&Credentials>,
+) -> String {
     let mut text = format!(
         "host = {}\nport = {}\npersistent = 0\n",
         gateway.host, gateway.port
     );
     for cert in gateway.trusted_cert.iter().chain(session_trust) {
         text.push_str(&format!("trusted-cert = {cert}\n"));
+    }
+    if let Some(credentials) = credentials {
+        text.push_str(&format!(
+            "username = {}\npassword = {}\n",
+            credentials.username, credentials.password
+        ));
+        if let Some(otp) = &credentials.otp {
+            text.push_str(&format!("otp = {otp}\n"));
+        }
     }
     text
 }
@@ -204,20 +218,35 @@ mod tests {
     fn config_file_has_only_gateway_settings() {
         let mut gw: Gateway = "vpn.example.com:10443".parse().unwrap();
         assert_eq!(
-            config_file(&gw, None),
+            config_file(&gw, &[], None),
             "host = vpn.example.com\nport = 10443\npersistent = 0\n"
         );
         gw.trusted_cert = Some(DIGEST.parse().unwrap());
-        assert!(config_file(&gw, None).ends_with(&format!("trusted-cert = {DIGEST}\n")));
+        assert!(config_file(&gw, &[], None).ends_with(&format!("trusted-cert = {DIGEST}\n")));
+    }
+
+    #[test]
+    fn config_file_adds_credentials() {
+        let gw: Gateway = "vpn.example.com:443".parse().unwrap();
+        let credentials = Credentials {
+            username: "anna".into(),
+            password: "a#b=c".into(),
+            otp: Some("123456".into()),
+        };
+        let text = config_file(&gw, &[], Some(&credentials));
+        assert!(text.ends_with("username = anna\npassword = a#b=c\notp = 123456\n"));
     }
 
     #[test]
     fn config_file_adds_session_trust() {
         let mut gw: Gateway = "vpn.example.com:10443".parse().unwrap();
         let once: CertDigest = "a".repeat(64).parse().unwrap();
-        assert!(config_file(&gw, Some(&once)).ends_with(&format!("trusted-cert = {once}\n")));
+        assert!(
+            config_file(&gw, std::slice::from_ref(&once), None)
+                .ends_with(&format!("trusted-cert = {once}\n"))
+        );
         gw.trusted_cert = Some(DIGEST.parse().unwrap());
-        let text = config_file(&gw, Some(&once));
+        let text = config_file(&gw, std::slice::from_ref(&once), None);
         assert_eq!(text.matches("trusted-cert = ").count(), 2);
     }
 

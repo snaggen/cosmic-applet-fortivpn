@@ -8,12 +8,13 @@
 //!   from stdin, reports [`protocol::Event`]s on stdout, and disconnects when stdin closes.
 //! - `cosmic-applet-fortivpn-configure` writes the root-owned [`gateway::Gateway`] config.
 //!
-//! The helper takes nothing from the caller but the login (a cookie or SAML login), so the
-//! gateway and the trusted certificate are only ever changed by an admin.
+//! The helper takes nothing from the caller but the profile id and the login, so gateways and
+//! trusted certificates are only ever changed by an admin.
 
 pub mod certcheck;
 pub mod gateway;
 pub mod openfortivpn;
+pub mod profile;
 pub mod protocol;
 pub mod saml;
 

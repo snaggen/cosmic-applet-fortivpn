@@ -7,7 +7,7 @@ use crate::{
     tunnel::{Ended, TunnelCommand},
 };
 use cosmic_applet_fortivpn::{
-    protocol::{Event, HelperError, Request, UntrustedCert},
+    protocol::{Event, HelperError, UntrustedCert},
     saml::SamlId,
 };
 use std::time::Instant;
@@ -63,7 +63,11 @@ pub enum Failure {
 pub enum Effect {
     None,
     Send(TunnelCommand),
-    /// Run the login window, then report with [`Status::on_login`].
+    /// Start the helper for the active profile; the agent builds the request (login,
+    /// credentials, intermediate certificate).
+    StartHelper,
+    /// Log in (the login window, or credentials for a password profile), then report with
+    /// [`Status::on_login`].
     Login,
     /// Hand openfortivpn the id from the login window (on its SAML listener).
     DeliverSamlId(SamlId),
@@ -129,21 +133,22 @@ impl Status {
         Effect::Login
     }
 
-    /// The login window ended. With the id, openfortivpn starts and gets it once listening;
-    /// if the window failed, openfortivpn starts and the login runs in the system browser.
+    /// The login ended. With a SAML id, openfortivpn starts and gets it once listening; with
+    /// credentials, openfortivpn logs in with them; if the window failed, openfortivpn starts
+    /// and the login runs in the system browser.
     pub fn on_login(&mut self, result: LoginResult) -> Effect {
         if *self != Self::LoggingIn {
             return Effect::None;
         }
         *self = match result {
             LoginResult::Done(id) => Self::Starting(id),
-            LoginResult::Failed(_) => Self::Connecting,
+            LoginResult::Password | LoginResult::Failed(_) => Self::Connecting,
             LoginResult::Cancelled => {
                 *self = Self::Disconnected;
                 return Effect::None;
             }
         };
-        Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
+        Effect::StartHelper
     }
 
     /// The agent found the connection broken: give up and stop the helper.
@@ -274,7 +279,7 @@ mod tests {
         assert!(!status.is_active());
         assert_eq!(
             status.on_login(LoginResult::Done(id())),
-            Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
+            Effect::StartHelper
         );
         assert_eq!(status, Status::Starting(id()));
         assert_eq!(
@@ -300,7 +305,7 @@ mod tests {
         let mut status = Status::LoggingIn;
         assert_eq!(
             status.on_login(LoginResult::Failed("no window".into())),
-            Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
+            Effect::StartHelper
         );
         assert_eq!(status, Status::Connecting);
         assert_eq!(
@@ -308,6 +313,13 @@ mod tests {
             Effect::OpenLoginPage
         );
         assert_eq!(status, Status::WaitingForLogin);
+    }
+
+    #[test]
+    fn password_login_starts_the_helper() {
+        let mut status = Status::LoggingIn;
+        assert_eq!(status.on_login(LoginResult::Password), Effect::StartHelper);
+        assert_eq!(status, Status::Connecting);
     }
 
     #[test]

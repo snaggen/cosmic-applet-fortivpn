@@ -4,7 +4,7 @@
 //!
 //! The agent owns the tunnel and serves [`AgentInterface`] under [`NAME`]. Every applet
 //! instance (one per panel output) is a client: it reads the state as properties, follows
-//! `PropertiesChanged`, and calls `Connect`, `Disconnect`, `SetGateway` and `ForgetCert`. D-Bus activation
+//! `PropertiesChanged`, and calls `Connect`, `Disconnect`, `SaveProfile` and the like. D-Bus activation
 //! starts the agent on first use.
 
 use crate::{
@@ -12,7 +12,10 @@ use crate::{
     stats::Traffic,
 };
 use cosmic::iced::{Subscription, futures::SinkExt, stream};
-use cosmic_applet_fortivpn::gateway::Gateway;
+use cosmic_applet_fortivpn::{
+    gateway::Gateway,
+    profile::{self, LoginMethod, Profile, ProfileId},
+};
 use std::{collections::HashMap, time::SystemTime};
 use tokio::sync::mpsc;
 use zbus::{
@@ -72,19 +75,72 @@ impl State {
     }
 }
 
+/// A profile as the applet shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub id: String,
+    pub name: String,
+    /// `saml` or `password`.
+    pub method: String,
+    /// `host:port`.
+    pub address: String,
+    /// SHA-256 digest of the certificate trusted although it does not validate, empty if
+    /// none.
+    pub trusted_cert: String,
+}
+
+/// How a profile travels on the bus: `(id, name, method, address, trusted_cert)`.
+type ProfileTuple = (String, String, String, String, String);
+
+impl ProfileInfo {
+    fn from_profile(profile: &Profile) -> Self {
+        Self {
+            id: profile.id.to_string(),
+            name: profile.name.clone(),
+            method: profile.method.as_str().to_owned(),
+            address: profile.gateway.address(),
+            trusted_cert: profile
+                .gateway
+                .trusted_cert
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn to_tuple(&self) -> ProfileTuple {
+        (
+            self.id.clone(),
+            self.name.clone(),
+            self.method.clone(),
+            self.address.clone(),
+            self.trusted_cert.clone(),
+        )
+    }
+
+    fn from_tuple((id, name, method, address, trusted_cert): ProfileTuple) -> Self {
+        Self {
+            id,
+            name,
+            method,
+            address,
+            trusted_cert,
+        }
+    }
+}
+
 /// Everything an applet shows, as one value. Published by the agent as properties.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub state: State,
     /// Unix time the tunnel came up, 0 when not connected.
     pub connected_since: u64,
-    /// `host:port`, empty when no gateway is configured.
-    pub gateway: String,
-    /// Why the gateway config could not be read, empty if it could.
-    pub gateway_error: String,
-    /// SHA-256 digest of the certificate trusted although it does not validate, empty if
-    /// none.
-    pub trusted_cert: String,
+    /// The VPN accounts, sorted by name.
+    pub profiles: Vec<ProfileInfo>,
+    /// Id of the profile the state is about, empty if none.
+    pub active: String,
+    /// Why profiles could not be read, empty if they could.
+    pub profiles_error: String,
     /// The tunnel's local IP address, empty when not connected.
     pub address: String,
     /// Traffic through the tunnel, zero when not connected.
@@ -100,16 +156,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// `address` and `traffic` are only published while connected.
-    pub fn new(
-        status: &Status,
-        gateway: &Result<Option<Gateway>, String>,
-        configuring: bool,
-        configure_error: Option<&str>,
-        address: Option<&str>,
-        traffic: Traffic,
-    ) -> Self {
-        let connected = matches!(status, Status::Connected { .. });
+    /// The state of the tunnel. The `with_*` methods add the rest.
+    pub fn new(status: &Status) -> Self {
         let (failure, failure_detail) = match status {
             Status::Failed(failure) => failure_code(failure),
             _ => (String::new(), String::new()),
@@ -128,33 +176,44 @@ impl Snapshot {
                 Status::Connected { since } => unix_time(*since),
                 _ => 0,
             },
-            gateway: match gateway {
-                Ok(Some(gateway)) => gateway.address(),
-                _ => String::new(),
-            },
-            gateway_error: gateway.as_ref().err().cloned().unwrap_or_default(),
-            trusted_cert: match gateway {
-                Ok(Some(Gateway {
-                    trusted_cert: Some(digest),
-                    ..
-                })) => digest.to_string(),
-                _ => String::new(),
-            },
-            address: match address {
-                Some(address) if connected => address.to_owned(),
-                _ => String::new(),
-            },
-            traffic: if connected {
-                traffic
-            } else {
-                Traffic::default()
-            },
             failure,
             failure_detail,
-            configuring,
-            configure_error: configure_error.unwrap_or_default().to_owned(),
-            auto_reconnect: false,
+            ..Self::default()
         }
+    }
+
+    /// Adds the profiles, why some could not be read, and the active one.
+    pub fn with_profiles(
+        mut self,
+        profiles: &[Profile],
+        error: Option<&str>,
+        active: Option<&ProfileId>,
+    ) -> Self {
+        self.profiles = profiles.iter().map(ProfileInfo::from_profile).collect();
+        self.profiles_error = error.unwrap_or_default().to_owned();
+        self.active = active.map(ToString::to_string).unwrap_or_default();
+        self
+    }
+
+    /// Adds whether the configure helper runs, and its last error.
+    pub fn with_configure(mut self, configuring: bool, error: Option<&str>) -> Self {
+        self.configuring = configuring;
+        self.configure_error = error.unwrap_or_default().to_owned();
+        self
+    }
+
+    /// Adds address and traffic, which are only published while connected.
+    pub fn with_tunnel(mut self, address: Option<&str>, traffic: Traffic) -> Self {
+        if self.state == State::Connected {
+            self.address = address.unwrap_or_default().to_owned();
+            self.traffic = traffic;
+        }
+        self
+    }
+
+    /// The active profile, if any.
+    pub fn active_profile(&self) -> Option<&ProfileInfo> {
+        self.profiles.iter().find(|p| p.id == self.active)
     }
 
     /// Adds the reconnect setting, and shows `Reconnecting` while a reconnect runs and the
@@ -185,9 +244,15 @@ impl Snapshot {
         Self {
             state: State::parse(&string("State")),
             connected_since: number("ConnectedSince"),
-            gateway: string("Gateway"),
-            gateway_error: string("GatewayError"),
-            trusted_cert: string("TrustedCert"),
+            profiles: props
+                .get("Profiles")
+                .and_then(|v| Vec::<ProfileTuple>::try_from(v.clone()).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(ProfileInfo::from_tuple)
+                .collect(),
+            active: string("ActiveProfile"),
+            profiles_error: string("ProfilesError"),
             address: string("Address"),
             traffic: Traffic {
                 received: number("Received"),
@@ -237,11 +302,21 @@ fn unix_time(instant: std::time::Instant) -> u64 {
 /// Requests from an applet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
-    Connect,
+    Connect(ProfileId),
     Disconnect,
-    SetGateway(String),
-    ForgetCert,
+    SaveProfile {
+        id: ProfileId,
+        name: String,
+        method: LoginMethod,
+        address: String,
+    },
+    RemoveProfile(ProfileId),
+    ForgetCert(ProfileId),
     SetAutoReconnect(bool),
+}
+
+fn invalid(err: impl std::fmt::Display) -> zbus::fdo::Error {
+    zbus::fdo::Error::InvalidArgs(err.to_string())
 }
 
 /// The agent's D-Bus object.
@@ -252,28 +327,51 @@ pub struct AgentInterface {
 
 #[zbus::interface(name = "io.github.snaggen.CosmicAppletFortivpn1")]
 impl AgentInterface {
-    fn connect(&self) {
-        let _ = self.commands.send(AgentCommand::Connect);
+    /// Connects the profile `id`, disconnecting another one first.
+    fn connect(&self, id: String) -> zbus::fdo::Result<()> {
+        let id = id.parse().map_err(invalid)?;
+        let _ = self.commands.send(AgentCommand::Connect(id));
+        Ok(())
     }
 
     fn disconnect(&self) {
         let _ = self.commands.send(AgentCommand::Disconnect);
     }
 
-    /// Sets the gateway (`host:port`). The agent runs the configure helper, which asks for
-    /// an admin password; the outcome shows in `Configuring` and `ConfigureError`.
-    fn set_gateway(&self, address: String) -> zbus::fdo::Result<()> {
-        address
-            .parse::<Gateway>()
-            .map_err(|err| zbus::fdo::Error::InvalidArgs(err.to_string()))?;
-        let _ = self.commands.send(AgentCommand::SetGateway(address));
+    /// Adds or changes a profile. The agent runs the configure helper, which asks for an
+    /// admin password; the outcome shows in `Configuring` and `ConfigureError`.
+    fn save_profile(
+        &self,
+        id: String,
+        name: String,
+        method: String,
+        address: String,
+    ) -> zbus::fdo::Result<()> {
+        let id = id.parse().map_err(invalid)?;
+        profile::validate_name(&name).map_err(invalid)?;
+        let method = method.parse().map_err(invalid)?;
+        address.parse::<Gateway>().map_err(invalid)?;
+        let _ = self.commands.send(AgentCommand::SaveProfile {
+            id,
+            name,
+            method,
+            address,
+        });
         Ok(())
     }
 
-    /// Stops trusting the certificate that does not validate. Needs an admin password, like
-    /// `SetGateway`.
-    fn forget_cert(&self) {
-        let _ = self.commands.send(AgentCommand::ForgetCert);
+    /// Removes a profile (admin password).
+    fn remove_profile(&self, id: String) -> zbus::fdo::Result<()> {
+        let id = id.parse().map_err(invalid)?;
+        let _ = self.commands.send(AgentCommand::RemoveProfile(id));
+        Ok(())
+    }
+
+    /// Stops trusting a profile's certificate that does not validate (admin password).
+    fn forget_cert(&self, id: String) -> zbus::fdo::Result<()> {
+        let id = id.parse().map_err(invalid)?;
+        let _ = self.commands.send(AgentCommand::ForgetCert(id));
+        Ok(())
     }
 
     /// Turns reconnecting by itself on or off. A user setting: no password needed.
@@ -297,18 +395,22 @@ impl AgentInterface {
     }
 
     #[zbus(property)]
-    fn gateway(&self) -> &str {
-        &self.snapshot.gateway
+    fn profiles(&self) -> Vec<ProfileTuple> {
+        self.snapshot
+            .profiles
+            .iter()
+            .map(ProfileInfo::to_tuple)
+            .collect()
     }
 
     #[zbus(property)]
-    fn gateway_error(&self) -> &str {
-        &self.snapshot.gateway_error
+    fn active_profile(&self) -> &str {
+        &self.snapshot.active
     }
 
     #[zbus(property)]
-    fn trusted_cert(&self) -> &str {
-        &self.snapshot.trusted_cert
+    fn profiles_error(&self) -> &str {
+        &self.snapshot.profiles_error
     }
 
     #[zbus(property)]
@@ -369,14 +471,14 @@ async fn publish(iface: &InterfaceRef<AgentInterface>, new: Snapshot) -> zbus::R
     if old.connected_since != new.connected_since {
         guard.connected_since_changed(emitter).await?;
     }
-    if old.gateway != new.gateway {
-        guard.gateway_changed(emitter).await?;
+    if old.profiles != new.profiles {
+        guard.profiles_changed(emitter).await?;
     }
-    if old.gateway_error != new.gateway_error {
-        guard.gateway_error_changed(emitter).await?;
+    if old.active != new.active {
+        guard.active_profile_changed(emitter).await?;
     }
-    if old.trusted_cert != new.trusted_cert {
-        guard.trusted_cert_changed(emitter).await?;
+    if old.profiles_error != new.profiles_error {
+        guard.profiles_error_changed(emitter).await?;
     }
     if old.address != new.address {
         guard.address_changed(emitter).await?;
@@ -501,10 +603,11 @@ async fn run_server(mut output: cosmic::iced::futures::channel::mpsc::Sender<Bus
     default_path = "/io/github/snaggen/CosmicAppletFortivpn"
 )]
 pub trait Agent {
-    fn connect(&self) -> zbus::Result<()>;
+    fn connect(&self, id: &str) -> zbus::Result<()>;
     fn disconnect(&self) -> zbus::Result<()>;
-    fn set_gateway(&self, address: &str) -> zbus::Result<()>;
-    fn forget_cert(&self) -> zbus::Result<()>;
+    fn save_profile(&self, id: &str, name: &str, method: &str, address: &str) -> zbus::Result<()>;
+    fn remove_profile(&self, id: &str) -> zbus::Result<()>;
+    fn forget_cert(&self, id: &str) -> zbus::Result<()>;
     fn set_auto_reconnect(&self, enabled: bool) -> zbus::Result<()>;
 }
 
@@ -530,37 +633,44 @@ mod tests {
         assert_eq!(State::parse("something-new"), State::Failed);
     }
 
+    fn profile() -> Profile {
+        Profile::parse_config(
+            "ace".parse().unwrap(),
+            "name = ACE\nmethod = saml\nhost = vpn.example.com\nport = 443\n",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn snapshot_from_status() {
-        let gateway = Ok(Some("vpn.example.com:443".parse().unwrap()));
-        let snapshot = Snapshot::new(
-            &Status::Failed(Failure::Other("boom".into())),
-            &gateway,
-            true,
-            Some("denied"),
-            Some("192.0.2.1"),
-            Traffic {
-                received: 1,
-                ..Traffic::default()
-            },
-        );
-        // Address and traffic only while connected.
-        assert_eq!(snapshot.address, "");
-        assert_eq!(snapshot.traffic, Traffic::default());
+        let profiles = [profile()];
+        let snapshot = Snapshot::new(&Status::Failed(Failure::Other("boom".into())))
+            .with_profiles(&profiles, None, Some(&profiles[0].id))
+            .with_configure(true, Some("denied"))
+            .with_tunnel(
+                Some("192.0.2.1"),
+                Traffic {
+                    received: 1,
+                    ..Traffic::default()
+                },
+            );
         assert_eq!(snapshot.state, State::Failed);
-        assert_eq!(snapshot.gateway, "vpn.example.com:443");
+        assert_eq!(
+            snapshot.active_profile().map(|p| p.address.as_str()),
+            Some("vpn.example.com:443")
+        );
         assert_eq!(snapshot.failure, "other");
         assert_eq!(snapshot.failure_detail, "boom");
         assert!(snapshot.configuring);
         assert_eq!(snapshot.configure_error, "denied");
+        // Address and traffic only while connected.
+        assert_eq!(snapshot.address, "");
+        assert_eq!(snapshot.traffic, Traffic::default());
 
-        let connected = Snapshot::new(
-            &Status::Connected {
-                since: Instant::now(),
-            },
-            &Ok(None),
-            false,
-            None,
+        let connected = Snapshot::new(&Status::Connected {
+            since: Instant::now(),
+        })
+        .with_tunnel(
             Some("192.0.2.1"),
             Traffic {
                 received: 7,
@@ -568,23 +678,15 @@ mod tests {
             },
         );
         assert_eq!(connected.state, State::Connected);
+        assert!(connected.connected_since > 0);
         assert_eq!(connected.address, "192.0.2.1");
         assert_eq!(connected.traffic.received, 7);
-        assert_eq!(connected.trusted_cert, "");
-        assert!(connected.connected_since > 0);
-        assert_eq!(connected.gateway, "");
+        assert_eq!(connected.active_profile(), None);
     }
 
     #[test]
     fn reconnecting_shows_until_connected() {
-        let failed = Snapshot::new(
-            &Status::Failed(Failure::Lost),
-            &Ok(None),
-            false,
-            None,
-            None,
-            Traffic::default(),
-        );
+        let failed = Snapshot::new(&Status::Failed(Failure::Lost));
         let shown = failed.clone().with_reconnect(true, true);
         assert_eq!(shown.state, State::Reconnecting);
         assert!(shown.auto_reconnect);
@@ -592,17 +694,31 @@ mod tests {
             failed.clone().with_reconnect(false, true).state,
             State::Failed
         );
-        let connected = Snapshot::new(
-            &Status::Connected {
-                since: Instant::now(),
-            },
-            &Ok(None),
-            false,
-            None,
-            None,
-            Traffic::default(),
-        );
+        let connected = Snapshot::new(&Status::Connected {
+            since: Instant::now(),
+        });
         assert_eq!(connected.with_reconnect(true, true).state, State::Connected);
+    }
+
+    #[test]
+    fn profiles_round_trip_through_properties() {
+        let profiles = [profile()];
+        let snapshot = Snapshot::new(&Status::Disconnected).with_profiles(&profiles, None, None);
+        let iface_value: Vec<ProfileTuple> = snapshot
+            .profiles
+            .iter()
+            .map(ProfileInfo::to_tuple)
+            .collect();
+        let props: HashMap<String, OwnedValue> = [(
+            "Profiles".to_owned(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(iface_value)).unwrap(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            Snapshot::from_properties(&props).profiles,
+            snapshot.profiles
+        );
     }
 
     #[test]
@@ -614,8 +730,8 @@ mod tests {
             ),
             ("ConnectedSince", OwnedValue::from(42u64)),
             (
-                "Gateway",
-                OwnedValue::from(zbus::zvariant::Str::from("a.example:1")),
+                "ActiveProfile",
+                OwnedValue::from(zbus::zvariant::Str::from("ace")),
             ),
             ("Configuring", OwnedValue::from(true)),
             ("SendRate", OwnedValue::from(9u64)),
@@ -626,7 +742,7 @@ mod tests {
         let snapshot = Snapshot::from_properties(&props);
         assert_eq!(snapshot.state, State::Connected);
         assert_eq!(snapshot.connected_since, 42);
-        assert_eq!(snapshot.gateway, "a.example:1");
+        assert_eq!(snapshot.active, "ace");
         assert!(snapshot.configuring);
         assert_eq!(snapshot.traffic.send_rate, 9);
         assert_eq!(snapshot.failure, "");

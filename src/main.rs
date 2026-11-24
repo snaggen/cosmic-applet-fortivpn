@@ -10,6 +10,7 @@ mod agent;
 mod applet;
 mod bus;
 mod client;
+mod keyring;
 mod liveness;
 mod localize;
 mod login;

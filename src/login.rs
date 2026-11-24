@@ -3,11 +3,13 @@
 //! Runs the login window (`cosmic-applet-fortivpn-login`) for the agent, in place of the
 //! system browser. It ends with the SAML session id, which the agent hands to openfortivpn.
 //!
-//! The login binary is installed next to this one. It keeps its WebKit profile in
-//! `$XDG_DATA_HOME/cosmic-applet-fortivpn/webview`, so the IdP session survives restarts.
+//! The login binary is installed next to this one. It keeps a WebKit profile per VPN profile
+//! in `$XDG_DATA_HOME/cosmic-applet-fortivpn/webview/<profile>`, so the IdP session survives
+//! restarts and the sessions of different customers stay apart.
 
 use cosmic_applet_fortivpn::{
     gateway::CertDigest,
+    profile::{LEGACY_ID, ProfileId},
     saml::{self, SamlId},
 };
 use std::{
@@ -32,8 +34,11 @@ const EXIT_CANCELLED: i32 = 2;
 pub enum LoginResult {
     /// The login is done; openfortivpn needs this id.
     Done(SamlId),
-    /// The user closed the window.
+    /// The user closed the window, or the password dialog.
     Cancelled,
+    /// Not from the window: the credentials for a password profile are ready (the agent holds
+    /// them).
+    Password,
     /// The window could not run or failed; the system browser takes over.
     Failed(String),
 }
@@ -43,6 +48,8 @@ pub enum LoginResult {
 pub struct Login {
     pub url: String,
     pub host: String,
+    /// Whose WebKit profile to use.
+    pub profile: ProfileId,
     /// A certificate the user trusted although it does not validate.
     pub trusted: Option<CertDigest>,
 }
@@ -54,7 +61,7 @@ pub async fn run(login: Login) -> LoginResult {
         Ok(binary) => binary,
         Err(why) => return LoginResult::Failed(why),
     };
-    let data_dir = match data_dir() {
+    let data_dir = match data_dir(&login.profile) {
         Ok(dir) => dir,
         Err(why) => return LoginResult::Failed(why),
     };
@@ -142,25 +149,53 @@ fn login_binary() -> Result<PathBuf, String> {
     }
 }
 
-/// The WebKit profile directory, created private to the user: the IdP session in it works
-/// like a password for weeks.
-fn data_dir() -> Result<PathBuf, String> {
+/// The WebKit profile directory of a VPN profile, created private to the user: the IdP
+/// session in it works like a password for weeks.
+fn data_dir(profile: &ProfileId) -> Result<PathBuf, String> {
     let base = match std::env::var_os("XDG_DATA_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".local/share"))
             .ok_or("neither XDG_DATA_HOME nor HOME is set")?,
     };
-    let dir = base.join("cosmic-applet-fortivpn").join("webview");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|err| format!("{}: {err}", dir.display()))?;
-    // The mode above only applies to directories created now; tighten one made earlier.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|err| format!("{}: {err}", dir.display()))?;
+    let webview = base.join("cosmic-applet-fortivpn").join("webview");
+    let dir = webview.join(profile.as_str());
+    let private = |dir: &PathBuf| -> Result<(), String> {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|err| format!("{}: {err}", dir.display()))?;
+        // The mode above only applies to directories created now; tighten one made earlier.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("{}: {err}", dir.display()))
+    };
+    private(&webview)?;
+    if profile.as_str() == LEGACY_ID {
+        move_single_profile(&webview, &dir);
+    }
+    private(&dir)?;
     Ok(dir)
+}
+
+/// Before profiles there was one WebKit profile directly in `webview`. It belonged to the
+/// gateway that became the profile `default`, so it moves there, keeping the IdP session.
+fn move_single_profile(webview: &std::path::Path, dir: &std::path::Path) {
+    if dir.exists() || !webview.join("cookies.sqlite").exists() {
+        return;
+    }
+    if let Err(err) = std::fs::create_dir(dir) {
+        tracing::warn!(%err, "could not move the old login profile");
+        return;
+    }
+    for name in ["cookies.sqlite", "data", "cache"] {
+        let from = webview.join(name);
+        if from.exists()
+            && let Err(err) = std::fs::rename(&from, dir.join(name))
+        {
+            tracing::warn!(%err, name, "could not move the old login profile");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ save = Spara
 
 gateway = Gateway
 gateway-placeholder = vpn.example.com:443
-gateway-missing = Ange adressen till VPN-gatewayen. För att spara den krävs ett administratörslösenord.
+gateway-missing = Lägg till ditt VPN-konto: ett namn och adressen till VPN-gatewayen. För att spara det krävs ett administratörslösenord.
 gateway-invalid = Ange värd och port, t.ex. vpn.example.com:443
 gateway-unreadable = Inställningarna för gatewayen kunde inte läsas: { $reason }
 
@@ -50,7 +50,7 @@ notify-failed = VPN-anslutningen kunde inte upprättas
 settings = Inställningar
 change = Ändra
 forget = Glöm
-gateway-change = Ange den nya adressen till VPN-gatewayen. För att spara den krävs ett administratörslösenord.
+gateway-change = Ändra VPN-kontot. För att spara det krävs ett administratörslösenord.
 certificate = Certifikat
 certificate-system = Verifieras av systemet
 certificate-trusted = Betrott certifikat (SHA-256)
@@ -64,3 +64,22 @@ decimal-separator = ,
 status-reconnecting = Återansluter…
 auto-reconnect = Återanslut automatiskt
 notify-reconnect-failed = VPN:et kunde inte återansluta
+
+password-dialog-title = Logga in på VPN:et
+password-dialog-body = Logga in på { $name }.
+username = Användarnamn
+password = Lösenord
+otp = Engångskod
+otp-placeholder = Bara om ditt VPN kräver en
+remember-password = Kom ihåg lösenordet
+password-invalid = Ange användarnamn och lösenord utan radbrytningar och utan mellanslag först eller sist (användarnamn högst 64 byte, lösenord högst 256); en engångskod har bara bokstäver och siffror.
+
+add-profile = Lägg till konto
+remove = Ta bort
+profile-name = Namn
+profile-name-placeholder = Kund eller företag
+profile-name-invalid = Ange ett namn på högst 64 tecken med minst en bokstav eller siffra.
+profile-add-intro = Lägg till ett VPN-konto. För att spara det krävs ett administratörslösenord.
+password-login = Logga in med användarnamn och lösenord (i stället för single sign-on)
+method-saml = single sign-on
+method-password = lösenord
