@@ -219,6 +219,7 @@ fn failure_code(failure: &Failure) -> (String, String) {
         Failure::NotAuthorized(why) => ("not-authorized", why.as_str()),
         Failure::Stopped => ("stopped", ""),
         Failure::Lost => ("lost", ""),
+        Failure::Unreachable(why) => ("unreachable", why.as_str()),
         Failure::Other(why) => ("other", why.as_str()),
     };
     (code.to_owned(), detail.to_owned())

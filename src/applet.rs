@@ -480,6 +480,7 @@ pub(crate) fn failure_text(snapshot: &Snapshot) -> String {
         "not-authorized" => fl!("error-not-authorized", reason = reason),
         "stopped" => fl!("error-stopped"),
         "lost" => fl!("error-lost"),
+        "unreachable" => fl!("error-unreachable", reason = reason),
         _ => fl!("error-other", reason = reason),
     }
 }

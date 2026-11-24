@@ -53,6 +53,8 @@ pub enum Failure {
     Stopped,
     /// The tunnel stopped carrying traffic (the network under it went away).
     Lost,
+    /// The gateway could not be reached before connecting.
+    Unreachable(String),
     Other(String),
 }
 
@@ -102,16 +104,21 @@ impl Status {
         self.login()
     }
 
-    /// The certificate check finished: `None` if trusted (or the check could not run, in
-    /// which case openfortivpn's own check decides), otherwise the certificate to ask about.
-    pub fn on_cert_checked(&mut self, untrusted: Option<UntrustedCert>) -> Effect {
+    /// The certificate check finished: `Ok(None)` if trusted, `Ok(Some(_))` with the
+    /// certificate to ask about, `Err` if the gateway could not be reached. Connecting without
+    /// a reachable gateway would only open the login window on an error page.
+    pub fn on_cert_checked(&mut self, result: Result<Option<UntrustedCert>, String>) -> Effect {
         if *self != Self::Checking {
             return Effect::None;
         }
-        match untrusted {
-            None => self.login(),
-            Some(cert) => {
+        match result {
+            Ok(None) => self.login(),
+            Ok(Some(cert)) => {
                 *self = Self::CertUntrusted(cert);
+                Effect::None
+            }
+            Err(why) => {
+                *self = Self::Failed(Failure::Unreachable(why));
                 Effect::None
             }
         }
@@ -262,7 +269,7 @@ mod tests {
         let mut status = Status::Disconnected;
         assert_eq!(status.connect(), Effect::CheckCert);
         assert_eq!(status, Status::Checking);
-        assert_eq!(status.on_cert_checked(None), Effect::Login);
+        assert_eq!(status.on_cert_checked(Ok(None)), Effect::Login);
         assert_eq!(status, Status::LoggingIn);
         assert!(!status.is_active());
         assert_eq!(
@@ -348,7 +355,7 @@ mod tests {
     fn untrusted_cert_is_asked_before_the_login() {
         let mut status = Status::Disconnected;
         status.connect();
-        assert_eq!(status.on_cert_checked(Some(cert())), Effect::None);
+        assert_eq!(status.on_cert_checked(Ok(Some(cert()))), Effect::None);
         assert_eq!(status, Status::CertUntrusted(cert()));
         // After the user trusts it, the login starts without another check.
         assert_eq!(status.connect_trusted(), Effect::Login);
@@ -357,12 +364,26 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_gateway_fails_before_the_login() {
+        let mut status = Status::Disconnected;
+        status.connect();
+        assert_eq!(
+            status.on_cert_checked(Err("timed out".into())),
+            Effect::None
+        );
+        assert_eq!(
+            status,
+            Status::Failed(Failure::Unreachable("timed out".into()))
+        );
+    }
+
+    #[test]
     fn cancel_during_the_check_ignores_its_result() {
         let mut status = Status::Disconnected;
         status.connect();
         assert_eq!(status.disconnect(), Effect::None);
         assert_eq!(status, Status::Disconnected);
-        assert_eq!(status.on_cert_checked(None), Effect::None);
+        assert_eq!(status.on_cert_checked(Ok(None)), Effect::None);
         assert_eq!(status, Status::Disconnected);
     }
 

@@ -31,6 +31,7 @@ error-busy = Another VPN connection is already running.
 error-auth-failed = The gateway rejected the login.
 error-not-authorized = Not allowed to start the VPN: { $reason }
 error-lost = The VPN connection stopped responding, probably because the network changed.
+error-unreachable = The VPN gateway cannot be reached: { $reason }
 error-stopped = The VPN connection stopped unexpectedly.
 error-other = The VPN could not be started: { $reason }
 

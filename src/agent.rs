@@ -60,6 +60,10 @@ const LOGIN_DIALOG_SIZE: Size = Size::new(440.0, 220.0);
 /// How often the traffic counters are read while connected.
 const TRAFFIC_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long the certificate check may take. Without network, name resolution alone can take
+/// minutes.
+const CERT_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn run() -> cosmic::iced::Result {
     let settings = cosmic::app::Settings::default()
         .no_main_window(true)
@@ -117,6 +121,8 @@ struct Agent {
     reconnects: u64,
     /// The tunnel was up when the system went to sleep: reconnect after resume.
     connect_after_resume: bool,
+    /// Numbers certificate checks, so a late result of a cancelled one is ignored.
+    cert_checks: u64,
 }
 
 /// What a status change meant for reconnecting.
@@ -143,7 +149,8 @@ enum Message {
     WindowClosed(Id),
     /// Drag on a dialog's header bar: move the window.
     Drag(Id),
-    CertChecked(Result<CertCheck, String>),
+    /// Certificate check `id` finished.
+    CertChecked(u64, Result<CertCheck, String>),
     LoginFinished(LoginResult),
     /// Time to read the traffic counters.
     TrafficTick,
@@ -205,6 +212,7 @@ impl cosmic::Application for Agent {
             reconnect: None,
             reconnects: 0,
             connect_after_resume: false,
+            cert_checks: 0,
         };
         match cosmic_config::Config::new(APP_ID, CONFIG_VERSION) {
             Ok(config) => {
@@ -306,17 +314,20 @@ impl Agent {
                 return self.run(effect);
             }
             Message::Drag(id) => return window::drag(id),
-            Message::CertChecked(result) => {
-                let untrusted = match result {
-                    Ok(CertCheck::Trusted) => None,
-                    Ok(CertCheck::Untrusted(cert)) => Some(cert),
+            Message::CertChecked(id, result) => {
+                // A check from an earlier, cancelled attempt says nothing about this one.
+                if id != self.cert_checks {
+                    return Task::none();
+                }
+                let result = match result {
+                    Ok(CertCheck::Trusted) => Ok(None),
+                    Ok(CertCheck::Untrusted(cert)) => Ok(Some(cert)),
                     Err(err) => {
-                        // openfortivpn checks again and reports what it finds.
                         tracing::warn!(%err, "could not check the gateway certificate");
-                        None
+                        Err(err)
                     }
                 };
-                let effect = self.status.on_cert_checked(untrusted);
+                let effect = self.status.on_cert_checked(result);
                 return self.run(effect);
             }
             Message::LoginFinished(result) => {
@@ -725,17 +736,23 @@ impl Agent {
         }
     }
 
-    /// Checks the gateway certificate on a blocking thread.
-    fn check_cert(&self) -> Task<cosmic::Action<Message>> {
+    /// Checks the gateway certificate on a blocking thread, for at most
+    /// [`CERT_CHECK_TIMEOUT`].
+    fn check_cert(&mut self) -> Task<cosmic::Action<Message>> {
+        self.cert_checks += 1;
+        let id = self.cert_checks;
         let Ok(Some(gateway)) = self.gateway.clone() else {
             // No gateway: let the helper report it.
-            return cosmic::task::future(async { Message::CertChecked(Err("no gateway".into())) });
+            return cosmic::task::message(Message::CertChecked(id, Ok(CertCheck::Trusted)));
         };
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || certcheck::check(&gateway))
-                .await
-                .unwrap_or_else(|err| Err(err.to_string()));
-            Message::CertChecked(result)
+            let check = tokio::task::spawn_blocking(move || certcheck::check(&gateway));
+            // On timeout the blocking thread finishes on its own; its result is dropped.
+            let result = match tokio::time::timeout(CERT_CHECK_TIMEOUT, check).await {
+                Ok(joined) => joined.unwrap_or_else(|err| Err(err.to_string())),
+                Err(_) => Err("no answer within 15 seconds".into()),
+            };
+            Message::CertChecked(id, result)
         })
     }
 

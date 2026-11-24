@@ -31,6 +31,7 @@ error-busy = En annan VPN-anslutning körs redan.
 error-auth-failed = Gatewayen avvisade inloggningen.
 error-not-authorized = Saknar behörighet att starta VPN:et: { $reason }
 error-lost = VPN-anslutningen slutade svara, troligen för att nätverket ändrades.
+error-unreachable = VPN-gatewayen går inte att nå: { $reason }
 error-stopped = VPN-anslutningen avbröts oväntat.
 error-other = VPN:et kunde inte startas: { $reason }
 
