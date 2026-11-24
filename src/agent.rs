@@ -11,7 +11,9 @@ use crate::{
     bus::{self, AgentCommand, BusUpdate, Snapshot},
     fl,
     login::{self, LoginResult},
+    notify::{self, Notification},
     state::{Effect, Failure, Status},
+    stats::{Counters, Meter, Traffic},
     tunnel::{self, TunnelCommand},
 };
 use cosmic::{
@@ -29,9 +31,10 @@ use cosmic_applet_fortivpn::{
     CONFIGURE_NAME, LIBEXEC_DIR,
     certcheck::{self, CertCheck},
     gateway::{CertDigest, Gateway},
-    protocol::UntrustedCert,
+    openfortivpn::TunnelDetail,
+    protocol::{Event, UntrustedCert},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const APP_ID: &str = "io.github.snaggen.CosmicAppletFortivpn";
@@ -40,6 +43,9 @@ const APP_ID: &str = "io.github.snaggen.CosmicAppletFortivpn";
 const CERT_DIALOG_SIZE: Size = Size::new(560.0, 520.0);
 /// The login dialog only points at the browser, so it stays small.
 const LOGIN_DIALOG_SIZE: Size = Size::new(440.0, 220.0);
+
+/// How often the traffic counters are read while connected.
+const TRAFFIC_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run() -> cosmic::iced::Result {
     let settings = cosmic::app::Settings::default()
@@ -77,6 +83,11 @@ struct Agent {
     login: Option<task::Handle>,
     /// The login window failed this time: the system browser and the login dialog stand in.
     browser_login: bool,
+    /// What openfortivpn reported about the tunnel of this attempt.
+    interface: Option<String>,
+    address: Option<String>,
+    meter: Meter,
+    traffic: Traffic,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +107,9 @@ enum Message {
     Drag(Id),
     CertChecked(Result<CertCheck, String>),
     LoginFinished(LoginResult),
+    /// Time to read the traffic counters.
+    TrafficTick,
+    Notified(Result<(), String>),
     /// The SAML id was handed to openfortivpn, or could not be.
     HandedOver(Result<(), String>),
 }
@@ -129,6 +143,10 @@ impl cosmic::Application for Agent {
             session_trust: None,
             login: None,
             browser_login: false,
+            interface: None,
+            address: None,
+            meter: Meter::default(),
+            traffic: Traffic::default(),
         };
         (agent, Task::none())
     }
@@ -138,6 +156,7 @@ impl cosmic::Application for Agent {
             tunnel::subscription().map(Message::Tunnel),
             bus::serve().map(Message::Bus),
             window::close_events().map(Message::WindowClosed),
+            self.traffic_ticks(),
         ])
     }
 
@@ -151,12 +170,17 @@ impl cosmic::Application for Agent {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         let before = self.status.clone();
         let task = self.handle(message);
+        let mut notification = Task::none();
         if self.status != before {
             tracing::info!(status = ?self.status, "status changed");
+            if !self.status.is_active() {
+                self.forget_tunnel();
+            }
+            notification = self.notify_failure(&before);
         }
         self.end_login_if_done();
         self.publish();
-        Task::batch([task, self.sync_dialog()])
+        Task::batch([task, self.sync_dialog(), notification])
     }
 
     /// The agent has no main window; this is never shown.
@@ -227,6 +251,9 @@ impl Agent {
                 let effect = self.status.on_login(result);
                 return self.run(effect);
             }
+            Message::TrafficTick => self.read_traffic(),
+            Message::Notified(Err(err)) => tracing::warn!(%err, "could not show a notification"),
+            Message::Notified(Ok(())) => {}
             Message::HandedOver(Ok(())) => {}
             Message::HandedOver(Err(why)) => {
                 tracing::warn!(%why, "could not hand the login to openfortivpn");
@@ -250,6 +277,9 @@ impl Agent {
         match update {
             tunnel::Update::Ready(sender) => self.tunnel = Some(sender),
             tunnel::Update::Event(event) => {
+                if let Event::Log(line) = &event {
+                    self.note_tunnel_detail(line);
+                }
                 let effect = self.status.on_event(event, Instant::now());
                 return self.run(effect);
             }
@@ -277,6 +307,9 @@ impl Agent {
                 let effect = self.status.disconnect();
                 return self.run(effect);
             }
+            BusUpdate::Command(AgentCommand::ForgetCert) => {
+                return self.configure(vec!["forget-cert".into()], false);
+            }
             BusUpdate::Command(AgentCommand::SetGateway(address)) => {
                 self.session_trust = None;
                 return self.configure(vec!["set-gateway".into(), address], false);
@@ -293,6 +326,71 @@ impl Agent {
             }
         }
         Task::none()
+    }
+
+    /// Reads the traffic counters every [`TRAFFIC_INTERVAL`] while connected.
+    fn traffic_ticks(&self) -> Subscription<Message> {
+        if matches!(self.status, Status::Connected { .. }) && self.interface.is_some() {
+            cosmic::iced::time::every(TRAFFIC_INTERVAL).map(|_| Message::TrafficTick)
+        } else {
+            Subscription::none()
+        }
+    }
+
+    fn read_traffic(&mut self) {
+        let Some(interface) = &self.interface else {
+            return;
+        };
+        match Counters::read(interface) {
+            Ok(counters) => self.traffic = self.meter.sample(Instant::now(), counters),
+            // The interface goes away when the tunnel drops; openfortivpn reports that.
+            Err(err) => tracing::debug!(%err, interface, "could not read the traffic counters"),
+        }
+    }
+
+    /// Keeps the interface name and address that pppd logs.
+    fn note_tunnel_detail(&mut self, line: &str) {
+        match TunnelDetail::parse(line) {
+            Some(TunnelDetail::Interface(name)) => self.interface = Some(name),
+            Some(TunnelDetail::LocalAddress(address)) => self.address = Some(address),
+            None => {}
+        }
+    }
+
+    /// Clears what was known about the last tunnel.
+    fn forget_tunnel(&mut self) {
+        self.interface = None;
+        self.address = None;
+        self.meter = Meter::default();
+        self.traffic = Traffic::default();
+    }
+
+    /// Notifies when the connection fails, since the popover is usually closed then. A
+    /// disconnect the user asked for ends in `Disconnected`, not `Failed`.
+    fn notify_failure(&self, before: &Status) -> Task<cosmic::Action<Message>> {
+        let Status::Failed(_) = &self.status else {
+            return Task::none();
+        };
+        let snapshot = Snapshot::new(
+            &self.status,
+            &self.gateway,
+            false,
+            None,
+            None,
+            Traffic::default(),
+        );
+        let summary = if matches!(before, Status::Connected { .. }) {
+            fl!("notify-disconnected")
+        } else {
+            fl!("notify-failed")
+        };
+        let notification = Notification {
+            summary,
+            body: crate::applet::failure_text(&snapshot),
+        };
+        cosmic::task::future(
+            async move { Message::Notified(notify::show(notification, APP_ID).await) },
+        )
     }
 
     /// Stops the login window once the login is no longer wanted (cancelled from an applet),
@@ -418,6 +516,8 @@ impl Agent {
             &self.gateway,
             self.configuring,
             self.configure_error.as_deref(),
+            self.address.as_deref(),
+            self.traffic,
         );
         if self.published.as_ref() == Some(&snapshot) {
             return;

@@ -28,7 +28,7 @@ pub enum ClientUpdate {
     /// Proxy for calling the agent.
     Ready(AgentProxy<'static>),
     /// The agent's state, or `None` while it cannot be reached.
-    Snapshot(Option<Snapshot>),
+    Snapshot(Option<Box<Snapshot>>),
 }
 
 pub fn subscription() -> Subscription<ClientUpdate> {
@@ -86,7 +86,7 @@ async fn watch(output: &mut Sender<ClientUpdate>) -> zbus::Result<()> {
 async fn send_snapshot(props: &PropertiesProxy<'_>, output: &mut Sender<ClientUpdate>) {
     let interface = InterfaceName::from_static_str_unchecked(INTERFACE);
     let snapshot = match props.get_all(interface).await {
-        Ok(map) => Some(Snapshot::from_properties(&map)),
+        Ok(map) => Some(Box::new(Snapshot::from_properties(&map))),
         Err(err) => {
             tracing::warn!(%err, "could not read the agent's state");
             None

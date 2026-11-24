@@ -40,3 +40,20 @@ trust = Trust
 login-dialog-title = Log in to the VPN
 login-dialog-body = Log in to { $host } in your browser. This window closes once you have logged in.
 open-login-page = Open login page
+
+notify-disconnected = The VPN connection was lost
+notify-failed = The VPN connection could not be established
+
+settings = Settings
+change = Change
+forget = Forget
+gateway-change = Enter the new address of the VPN gateway. Saving it needs an administrator password.
+certificate = Certificate
+certificate-system = Verified by the system
+certificate-trusted = Trusted certificate (SHA-256)
+address = Address
+uptime = Connected for
+received = Received
+sent = Sent
+# Decimal separator in amounts such as 1.5 MB.
+decimal-separator = .

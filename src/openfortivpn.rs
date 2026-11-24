@@ -120,6 +120,52 @@ impl OutputParser {
     }
 }
 
+/// Facts about the tunnel that openfortivpn (through pppd) logs while it comes up. The helper
+/// passes these lines on as [`Event::Log`]; the agent picks them out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TunnelDetail {
+    /// The network interface, e.g. `ppp0`.
+    Interface(String),
+    /// The tunnel's local IP address.
+    LocalAddress(String),
+}
+
+impl TunnelDetail {
+    /// Recognises pppd's `Using interface ppp0` and `local  IP address 192.0.2.1`.
+    ///
+    /// ```
+    /// use cosmic_applet_fortivpn::openfortivpn::TunnelDetail;
+    ///
+    /// assert_eq!(
+    ///     TunnelDetail::parse("Using interface ppp0"),
+    ///     Some(TunnelDetail::Interface("ppp0".into()))
+    /// );
+    /// assert_eq!(
+    ///     TunnelDetail::parse("local  IP address 192.0.2.1"),
+    ///     Some(TunnelDetail::LocalAddress("192.0.2.1".into()))
+    /// );
+    /// ```
+    pub fn parse(line: &str) -> Option<Self> {
+        let text = strip_level(line);
+        if let Some(name) = text.strip_prefix("Using interface ") {
+            let name = name.trim();
+            // The name becomes part of a /sys path, so only plain interface names pass.
+            let valid = !name.is_empty()
+                && name.len() <= 15
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            return valid.then(|| Self::Interface(name.to_owned()));
+        }
+        let address = text.strip_prefix("local")?.trim_start();
+        let address = address.strip_prefix("IP address")?.trim();
+        address
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| Self::LocalAddress(ip.to_string()))
+    }
+}
+
 /// Strips openfortivpn's `LEVEL:` prefix and the padding after it.
 fn strip_level(line: &str) -> &str {
     let line = line.trim_end();
@@ -233,6 +279,29 @@ ERROR:          {DIGEST}
     fn auth_failure() {
         let output = "ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc.\n";
         assert_eq!(parse_all(output), vec![Event::AuthFailed]);
+    }
+
+    #[test]
+    fn tunnel_details() {
+        assert_eq!(
+            TunnelDetail::parse("Using interface ppp0"),
+            Some(TunnelDetail::Interface("ppp0".into()))
+        );
+        assert_eq!(
+            TunnelDetail::parse("local  IP address 192.168.77.13"),
+            Some(TunnelDetail::LocalAddress("192.168.77.13".into()))
+        );
+        assert_eq!(
+            TunnelDetail::parse("remote IP address 125.63.190.187"),
+            None
+        );
+        assert_eq!(TunnelDetail::parse("Using interface ../../etc"), None);
+        assert_eq!(TunnelDetail::parse("Using interface "), None);
+        assert_eq!(TunnelDetail::parse("local  IP address nonsense"), None);
+        assert_eq!(
+            TunnelDetail::parse("INFO:   Tunnel is up and running."),
+            None
+        );
     }
 
     #[test]

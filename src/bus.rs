@@ -4,10 +4,13 @@
 //!
 //! The agent owns the tunnel and serves [`AgentInterface`] under [`NAME`]. Every applet
 //! instance (one per panel output) is a client: it reads the state as properties, follows
-//! `PropertiesChanged`, and calls `Connect`, `Disconnect` and `SetGateway`. D-Bus activation
+//! `PropertiesChanged`, and calls `Connect`, `Disconnect`, `SetGateway` and `ForgetCert`. D-Bus activation
 //! starts the agent on first use.
 
-use crate::state::{Failure, Status};
+use crate::{
+    state::{Failure, Status},
+    stats::Traffic,
+};
 use cosmic::iced::{Subscription, futures::SinkExt, stream};
 use cosmic_applet_fortivpn::gateway::Gateway;
 use std::{collections::HashMap, time::SystemTime};
@@ -75,6 +78,13 @@ pub struct Snapshot {
     pub gateway: String,
     /// Why the gateway config could not be read, empty if it could.
     pub gateway_error: String,
+    /// SHA-256 digest of the certificate trusted although it does not validate, empty if
+    /// none.
+    pub trusted_cert: String,
+    /// The tunnel's local IP address, empty when not connected.
+    pub address: String,
+    /// Traffic through the tunnel, zero when not connected.
+    pub traffic: Traffic,
     /// Failure code when `state` is `Failed`: see [`failure_code`].
     pub failure: String,
     pub failure_detail: String,
@@ -84,12 +94,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// `address` and `traffic` are only published while connected.
     pub fn new(
         status: &Status,
         gateway: &Result<Option<Gateway>, String>,
         configuring: bool,
         configure_error: Option<&str>,
+        address: Option<&str>,
+        traffic: Traffic,
     ) -> Self {
+        let connected = matches!(status, Status::Connected { .. });
         let (failure, failure_detail) = match status {
             Status::Failed(failure) => failure_code(failure),
             _ => (String::new(), String::new()),
@@ -113,6 +127,22 @@ impl Snapshot {
                 _ => String::new(),
             },
             gateway_error: gateway.as_ref().err().cloned().unwrap_or_default(),
+            trusted_cert: match gateway {
+                Ok(Some(Gateway {
+                    trusted_cert: Some(digest),
+                    ..
+                })) => digest.to_string(),
+                _ => String::new(),
+            },
+            address: match address {
+                Some(address) if connected => address.to_owned(),
+                _ => String::new(),
+            },
+            traffic: if connected {
+                traffic
+            } else {
+                Traffic::default()
+            },
             failure,
             failure_detail,
             configuring,
@@ -129,14 +159,25 @@ impl Snapshot {
                 .and_then(|v| String::try_from(v.clone()).ok())
                 .unwrap_or_default()
         };
+        let number = |key: &str| {
+            props
+                .get(key)
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or_default()
+        };
         Self {
             state: State::parse(&string("State")),
-            connected_since: props
-                .get("ConnectedSince")
-                .and_then(|v| u64::try_from(v).ok())
-                .unwrap_or_default(),
+            connected_since: number("ConnectedSince"),
             gateway: string("Gateway"),
             gateway_error: string("GatewayError"),
+            trusted_cert: string("TrustedCert"),
+            address: string("Address"),
+            traffic: Traffic {
+                received: number("Received"),
+                sent: number("Sent"),
+                receive_rate: number("ReceiveRate"),
+                send_rate: number("SendRate"),
+            },
             failure: string("Failure"),
             failure_detail: string("FailureDetail"),
             configuring: props
@@ -176,6 +217,7 @@ pub enum AgentCommand {
     Connect,
     Disconnect,
     SetGateway(String),
+    ForgetCert,
 }
 
 /// The agent's D-Bus object.
@@ -204,6 +246,12 @@ impl AgentInterface {
         Ok(())
     }
 
+    /// Stops trusting the certificate that does not validate. Needs an admin password, like
+    /// `SetGateway`.
+    fn forget_cert(&self) {
+        let _ = self.commands.send(AgentCommand::ForgetCert);
+    }
+
     #[zbus(property)]
     fn state(&self) -> &str {
         self.snapshot.state.as_str()
@@ -222,6 +270,36 @@ impl AgentInterface {
     #[zbus(property)]
     fn gateway_error(&self) -> &str {
         &self.snapshot.gateway_error
+    }
+
+    #[zbus(property)]
+    fn trusted_cert(&self) -> &str {
+        &self.snapshot.trusted_cert
+    }
+
+    #[zbus(property)]
+    fn address(&self) -> &str {
+        &self.snapshot.address
+    }
+
+    #[zbus(property)]
+    fn received(&self) -> u64 {
+        self.snapshot.traffic.received
+    }
+
+    #[zbus(property)]
+    fn sent(&self) -> u64 {
+        self.snapshot.traffic.sent
+    }
+
+    #[zbus(property)]
+    fn receive_rate(&self) -> u64 {
+        self.snapshot.traffic.receive_rate
+    }
+
+    #[zbus(property)]
+    fn send_rate(&self) -> u64 {
+        self.snapshot.traffic.send_rate
     }
 
     #[zbus(property)]
@@ -262,6 +340,24 @@ async fn publish(iface: &InterfaceRef<AgentInterface>, new: Snapshot) -> zbus::R
     }
     if old.gateway_error != new.gateway_error {
         guard.gateway_error_changed(emitter).await?;
+    }
+    if old.trusted_cert != new.trusted_cert {
+        guard.trusted_cert_changed(emitter).await?;
+    }
+    if old.address != new.address {
+        guard.address_changed(emitter).await?;
+    }
+    if old.traffic.received != new.traffic.received {
+        guard.received_changed(emitter).await?;
+    }
+    if old.traffic.sent != new.traffic.sent {
+        guard.sent_changed(emitter).await?;
+    }
+    if old.traffic.receive_rate != new.traffic.receive_rate {
+        guard.receive_rate_changed(emitter).await?;
+    }
+    if old.traffic.send_rate != new.traffic.send_rate {
+        guard.send_rate_changed(emitter).await?;
     }
     if old.failure != new.failure {
         guard.failure_changed(emitter).await?;
@@ -371,6 +467,7 @@ pub trait Agent {
     fn connect(&self) -> zbus::Result<()>;
     fn disconnect(&self) -> zbus::Result<()>;
     fn set_gateway(&self, address: &str) -> zbus::Result<()>;
+    fn forget_cert(&self) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -402,7 +499,15 @@ mod tests {
             &gateway,
             true,
             Some("denied"),
+            Some("192.0.2.1"),
+            Traffic {
+                received: 1,
+                ..Traffic::default()
+            },
         );
+        // Address and traffic only while connected.
+        assert_eq!(snapshot.address, "");
+        assert_eq!(snapshot.traffic, Traffic::default());
         assert_eq!(snapshot.state, State::Failed);
         assert_eq!(snapshot.gateway, "vpn.example.com:443");
         assert_eq!(snapshot.failure, "other");
@@ -417,8 +522,16 @@ mod tests {
             &Ok(None),
             false,
             None,
+            Some("192.0.2.1"),
+            Traffic {
+                received: 7,
+                ..Traffic::default()
+            },
         );
         assert_eq!(connected.state, State::Connected);
+        assert_eq!(connected.address, "192.0.2.1");
+        assert_eq!(connected.traffic.received, 7);
+        assert_eq!(connected.trusted_cert, "");
         assert!(connected.connected_since > 0);
         assert_eq!(connected.gateway, "");
     }
@@ -436,6 +549,7 @@ mod tests {
                 OwnedValue::from(zbus::zvariant::Str::from("a.example:1")),
             ),
             ("Configuring", OwnedValue::from(true)),
+            ("SendRate", OwnedValue::from(9u64)),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
@@ -445,6 +559,7 @@ mod tests {
         assert_eq!(snapshot.connected_since, 42);
         assert_eq!(snapshot.gateway, "a.example:1");
         assert!(snapshot.configuring);
+        assert_eq!(snapshot.traffic.send_rate, 9);
         assert_eq!(snapshot.failure, "");
     }
 }

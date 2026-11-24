@@ -40,3 +40,20 @@ trust = Lita på
 login-dialog-title = Logga in på VPN:et
 login-dialog-body = Logga in på { $host } i webbläsaren. Fönstret stängs när du har loggat in.
 open-login-page = Öppna inloggningssidan
+
+notify-disconnected = VPN-anslutningen bröts
+notify-failed = VPN-anslutningen kunde inte upprättas
+
+settings = Inställningar
+change = Ändra
+forget = Glöm
+gateway-change = Ange den nya adressen till VPN-gatewayen. För att spara den krävs ett administratörslösenord.
+certificate = Certifikat
+certificate-system = Verifieras av systemet
+certificate-trusted = Betrott certifikat (SHA-256)
+address = Adress
+uptime = Ansluten i
+received = Mottaget
+sent = Skickat
+# Decimaltecken i mängder som 1,5 MB.
+decimal-separator = ,

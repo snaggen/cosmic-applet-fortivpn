@@ -12,7 +12,9 @@ mod bus;
 mod client;
 mod localize;
 mod login;
+mod notify;
 mod state;
+mod stats;
 mod tunnel;
 
 /// Log filter when `RUST_LOG` is unset. State changes in the journal are what makes a problem
