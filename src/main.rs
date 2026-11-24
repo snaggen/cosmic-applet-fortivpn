@@ -14,6 +14,7 @@ mod liveness;
 mod localize;
 mod login;
 mod notify;
+mod reconnect;
 mod sleep;
 mod state;
 mod stats;

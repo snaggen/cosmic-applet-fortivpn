@@ -1,4 +1,4 @@
-vpn = VPN
+vpn = OpenFortiVPN
 
 status-disconnected = Frånkopplad
 status-connecting = Ansluter…
@@ -59,3 +59,7 @@ received = Mottaget
 sent = Skickat
 # Decimaltecken i mängder som 1,5 MB.
 decimal-separator = ,
+
+status-reconnecting = Återansluter…
+auto-reconnect = Återanslut automatiskt
+notify-reconnect-failed = VPN:et kunde inte återansluta

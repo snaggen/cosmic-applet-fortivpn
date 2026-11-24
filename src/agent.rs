@@ -13,6 +13,7 @@ use crate::{
     liveness::{self, STALL_BEFORE_PROBE, STALL_WITHOUT_PROBE, Watch},
     login::{self, LoginResult},
     notify::{self, Notification},
+    reconnect::{self, Reconnect},
     sleep::{self, SleepUpdate},
     state::{Effect, Failure, Status},
     stats::{Counters, Meter, Traffic},
@@ -21,6 +22,7 @@ use crate::{
 use cosmic::{
     ApplicationExt, Element, Task,
     app::Core,
+    cosmic_config::{self, ConfigGet, ConfigSet},
     iced::{
         Length, Size, Subscription, task,
         widget::{column, row, space::horizontal as horizontal_space},
@@ -43,6 +45,11 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 const APP_ID: &str = "io.github.snaggen.CosmicAppletFortivpn";
+
+/// Version of the agent's settings in cosmic-config.
+const CONFIG_VERSION: u64 = 1;
+/// cosmic-config key: reconnect by itself (off by default).
+const AUTO_RECONNECT: &str = "auto_reconnect";
 
 /// Size of the certificate dialog. Wayland lets the compositor place it.
 const CERT_DIALOG_SIZE: Size = Size::new(560.0, 520.0);
@@ -100,6 +107,24 @@ struct Agent {
     /// Holds or releases logind's sleep inhibitor.
     sleep_lock: Option<UnboundedSender<bool>>,
     holding_sleep: bool,
+    /// The agent's settings, `None` if cosmic-config cannot be used.
+    config: Option<cosmic_config::Config>,
+    auto_reconnect: bool,
+    /// A reconnect in progress (only with `auto_reconnect`).
+    reconnect: Option<Reconnect>,
+    /// Numbers reconnects, so a cancelled one's timer is ignored.
+    reconnects: u64,
+    /// The tunnel was up when the system went to sleep: reconnect after resume.
+    connect_after_resume: bool,
+}
+
+/// What a status change meant for reconnecting.
+enum ReconnectStep {
+    None,
+    /// A reconnect runs or just started: the failure is not reported yet.
+    Pending,
+    /// All attempts failed.
+    GaveUp,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +149,11 @@ enum Message {
     /// Whether the tunnel answered a probe.
     Probed(bool),
     Sleep(SleepUpdate),
+    /// Time for an attempt of reconnect `id`; `false` if the network did not come back.
+    Reconnect {
+        id: u64,
+        network: bool,
+    },
     Notified(Result<(), String>),
     /// The SAML id was handed to openfortivpn, or could not be.
     HandedOver(Result<(), String>),
@@ -144,7 +174,7 @@ impl cosmic::Application for Agent {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Self::Message>>) {
-        let agent = Self {
+        let mut agent = Self {
             core,
             status: Status::Disconnected,
             gateway: load_gateway(),
@@ -167,7 +197,19 @@ impl cosmic::Application for Agent {
             probing: false,
             sleep_lock: None,
             holding_sleep: false,
+            config: None,
+            auto_reconnect: false,
+            reconnect: None,
+            reconnects: 0,
+            connect_after_resume: false,
         };
+        match cosmic_config::Config::new(APP_ID, CONFIG_VERSION) {
+            Ok(config) => {
+                agent.auto_reconnect = config.get(AUTO_RECONNECT).unwrap_or(false);
+                agent.config = Some(config);
+            }
+            Err(err) => tracing::warn!(%err, "settings unavailable"),
+        }
         (agent, Task::none())
     }
 
@@ -191,18 +233,26 @@ impl cosmic::Application for Agent {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         let before = self.status.clone();
         let task = self.handle(message);
-        let mut notification = Task::none();
+        let mut follow_up = Task::none();
         if self.status != before {
             tracing::info!(status = ?self.status, "status changed");
             if !self.status.is_active() {
                 self.forget_tunnel();
             }
-            notification = self.notify_failure(&before);
+            let (step, reconnect) = self.follow_reconnect(&before);
+            let notification = match step {
+                ReconnectStep::None => self.notify_failure(&before, None),
+                ReconnectStep::Pending => Task::none(),
+                ReconnectStep::GaveUp => {
+                    self.notify_failure(&before, Some(fl!("notify-reconnect-failed")))
+                }
+            };
+            follow_up = Task::batch([reconnect, notification]);
         }
         self.end_login_if_done();
         self.sync_sleep_lock();
         self.publish();
-        Task::batch([task, self.sync_dialog(), notification])
+        Task::batch([task, self.sync_dialog(), follow_up])
     }
 
     /// The agent has no main window; this is never shown.
@@ -276,6 +326,7 @@ impl Agent {
             Message::TrafficTick => return self.read_traffic(),
             Message::Probed(alive) => return self.on_probed(alive),
             Message::Sleep(update) => return self.on_sleep(update),
+            Message::Reconnect { id, network } => return self.attempt_reconnect(id, network),
             Message::Notified(Err(err)) => tracing::warn!(%err, "could not show a notification"),
             Message::Notified(Ok(())) => {}
             Message::HandedOver(Ok(())) => {}
@@ -324,12 +375,17 @@ impl Agent {
                 self.published = None;
             }
             BusUpdate::Command(AgentCommand::Connect) => {
+                self.cancel_reconnect();
                 let effect = self.status.connect();
                 return self.run(effect);
             }
             BusUpdate::Command(AgentCommand::Disconnect) => {
+                self.cancel_reconnect();
                 let effect = self.status.disconnect();
                 return self.run(effect);
+            }
+            BusUpdate::Command(AgentCommand::SetAutoReconnect(enabled)) => {
+                self.set_auto_reconnect(enabled);
             }
             BusUpdate::Command(AgentCommand::ForgetCert) => {
                 return self.configure(vec!["forget-cert".into()], false);
@@ -426,12 +482,19 @@ impl Agent {
             }
             SleepUpdate::Suspending => {
                 tracing::info!(status = ?self.status, "system is going to sleep");
+                self.connect_after_resume = self.auto_reconnect
+                    && (matches!(self.status, Status::Connected { .. })
+                        || self.reconnect.is_some());
+                self.cancel_reconnect();
                 // The lock is released once the tunnel is down (sync_sleep_lock).
                 let effect = self.status.disconnect();
                 return self.run(effect);
             }
             SleepUpdate::Resumed => {
                 tracing::info!(status = ?self.status, "system resumed");
+                if std::mem::take(&mut self.connect_after_resume) {
+                    return self.start_reconnect();
+                }
                 // Still up means the disconnect before sleep did not happen in time.
                 if matches!(self.status, Status::Connected { .. }) {
                     return self.probe();
@@ -479,9 +542,102 @@ impl Agent {
         self.probing = false;
     }
 
+    /// Decides what a status change means for reconnecting, and starts or continues it.
+    fn follow_reconnect(
+        &mut self,
+        before: &Status,
+    ) -> (ReconnectStep, Task<cosmic::Action<Message>>) {
+        let was_connected = matches!(before, Status::Connected { .. });
+        match &self.status {
+            Status::Connected { .. } => {
+                if self.reconnect.take().is_some() {
+                    tracing::info!("reconnected");
+                }
+                (ReconnectStep::None, Task::none())
+            }
+            Status::Failed(Failure::Lost | Failure::Stopped)
+                if was_connected && self.auto_reconnect =>
+            {
+                (ReconnectStep::Pending, self.start_reconnect())
+            }
+            Status::Failed(_) if self.reconnect.is_some() => match self.schedule_reconnect() {
+                Some(task) => (ReconnectStep::Pending, task),
+                None => (ReconnectStep::GaveUp, Task::none()),
+            },
+            // The user cancelled the attempt, or must decide about the certificate.
+            Status::Disconnected | Status::CertUntrusted(_) => {
+                self.cancel_reconnect();
+                (ReconnectStep::None, Task::none())
+            }
+            _ => (ReconnectStep::None, Task::none()),
+        }
+    }
+
+    fn start_reconnect(&mut self) -> Task<cosmic::Action<Message>> {
+        self.reconnects += 1;
+        tracing::info!("reconnecting");
+        self.reconnect = Some(Reconnect::new(self.reconnects));
+        self.schedule_reconnect().unwrap_or_else(Task::none)
+    }
+
+    /// Schedules the next attempt; `None` (and the reconnect ended) once all are used up.
+    fn schedule_reconnect(&mut self) -> Option<Task<cosmic::Action<Message>>> {
+        let reconnect = self.reconnect.as_mut()?;
+        let Some(delay) = reconnect.next_delay() else {
+            tracing::warn!("giving up reconnecting");
+            self.reconnect = None;
+            return None;
+        };
+        let id = reconnect.id;
+        Some(cosmic::task::future(async move {
+            Message::Reconnect {
+                id,
+                network: reconnect::wait(delay).await,
+            }
+        }))
+    }
+
+    fn attempt_reconnect(&mut self, id: u64, network: bool) -> Task<cosmic::Action<Message>> {
+        if self.reconnect.as_ref().map(|r| r.id) != Some(id) {
+            return Task::none();
+        }
+        if !network {
+            tracing::info!("network did not come back");
+            return self.schedule_reconnect().unwrap_or_else(|| {
+                // The status stays as it is, so report giving up here.
+                self.notify_failure(&self.status.clone(), Some(fl!("notify-reconnect-failed")))
+            });
+        }
+        let effect = self.status.connect();
+        self.run(effect)
+    }
+
+    fn cancel_reconnect(&mut self) {
+        if self.reconnect.take().is_some() {
+            tracing::info!("reconnect cancelled");
+        }
+    }
+
+    fn set_auto_reconnect(&mut self, enabled: bool) {
+        self.auto_reconnect = enabled;
+        if !enabled {
+            self.cancel_reconnect();
+        }
+        if let Some(config) = &self.config
+            && let Err(err) = config.set(AUTO_RECONNECT, enabled)
+        {
+            tracing::warn!(%err, "could not save the settings");
+        }
+    }
+
     /// Notifies when the connection fails, since the popover is usually closed then. A
-    /// disconnect the user asked for ends in `Disconnected`, not `Failed`.
-    fn notify_failure(&self, before: &Status) -> Task<cosmic::Action<Message>> {
+    /// disconnect the user asked for ends in `Disconnected`, not `Failed`. `summary` replaces
+    /// the usual title.
+    fn notify_failure(
+        &self,
+        before: &Status,
+        summary: Option<String>,
+    ) -> Task<cosmic::Action<Message>> {
         let Status::Failed(_) = &self.status else {
             return Task::none();
         };
@@ -493,11 +649,13 @@ impl Agent {
             None,
             Traffic::default(),
         );
-        let summary = if matches!(before, Status::Connected { .. }) {
-            fl!("notify-disconnected")
-        } else {
-            fl!("notify-failed")
-        };
+        let summary = summary.unwrap_or_else(|| {
+            if matches!(before, Status::Connected { .. }) {
+                fl!("notify-disconnected")
+            } else {
+                fl!("notify-failed")
+            }
+        });
         let notification = Notification {
             summary,
             body: crate::applet::failure_text(&snapshot),
@@ -632,7 +790,8 @@ impl Agent {
             self.configure_error.as_deref(),
             self.address.as_deref(),
             self.traffic,
-        );
+        )
+        .with_reconnect(self.reconnect.is_some(), self.auto_reconnect);
         if self.published.as_ref() == Some(&snapshot) {
             return;
         }

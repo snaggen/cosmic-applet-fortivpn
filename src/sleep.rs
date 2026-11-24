@@ -64,7 +64,7 @@ async fn watch(output: &mut Sender<SleepUpdate>) -> zbus::Result<()> {
             Some(wanted) = hold.recv() => {
                 if wanted && lock.is_none() {
                     match manager
-                        .inhibit("sleep", "VPN", "Disconnect the VPN before sleep", "delay")
+                        .inhibit("sleep", "OpenFortiVPN", "Disconnect the VPN before sleep", "delay")
                         .await
                     {
                         Ok(fd) => lock = Some(fd),

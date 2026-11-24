@@ -1,4 +1,4 @@
-vpn = VPN
+vpn = OpenFortiVPN
 
 status-disconnected = Disconnected
 status-connecting = Connecting…
@@ -59,3 +59,7 @@ received = Received
 sent = Sent
 # Decimal separator in amounts such as 1.5 MB.
 decimal-separator = .
+
+status-reconnecting = Reconnecting…
+auto-reconnect = Reconnect automatically
+notify-reconnect-failed = The VPN could not reconnect

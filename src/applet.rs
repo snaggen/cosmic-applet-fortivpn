@@ -21,7 +21,7 @@ use cosmic::{
         window::Id,
     },
     surface, theme,
-    widget::{button, divider, icon, text, text_input},
+    widget::{button, divider, icon, text, text_input, toggler},
 };
 use cosmic_applet_fortivpn::gateway::Gateway;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,6 +58,7 @@ pub enum Message {
     EditGateway,
     CancelEditGateway,
     ForgetCert,
+    SetAutoReconnect(bool),
     /// Redraw, for the uptime.
     Tick,
     /// A call to the agent finished.
@@ -158,6 +159,10 @@ impl cosmic::Application for Applet {
             Message::ForgetCert => {
                 return self.call(|agent| async move { agent.forget_cert().await });
             }
+            Message::SetAutoReconnect(enabled) => {
+                return self
+                    .call(move |agent| async move { agent.set_auto_reconnect(enabled).await });
+            }
             Message::Tick => {}
             Message::Called(Err(err)) => tracing::warn!(%err, "call to the agent failed"),
             Message::Called(Ok(())) => {}
@@ -238,7 +243,7 @@ impl Applet {
         })
     }
 
-    /// Icon, "VPN", the state, and the gateway.
+    /// Icon, "OpenFortiVPN", the state, and the gateway.
     fn headline(&self) -> Element<'_, Message> {
         let spacing = theme::active().cosmic().spacing;
         let mut details = column![
@@ -365,7 +370,11 @@ impl Applet {
                 forget.into(),
             )
         };
-        let mut section = column![gateway, cert].spacing(spacing.space_xs);
+        let reconnect = toggler(snapshot.auto_reconnect)
+            .label(fl!("auto-reconnect"))
+            .on_toggle(Message::SetAutoReconnect)
+            .width(Length::Fill);
+        let mut section = column![gateway, cert, reconnect].spacing(spacing.space_xs);
         if !self.editing_gateway && !snapshot.configure_error.is_empty() {
             section = section.push(text::caption(snapshot.configure_error.clone()));
         }
@@ -417,7 +426,8 @@ impl Applet {
             State::Connecting
             | State::WaitingForLogin
             | State::Connected
-            | State::CertUntrusted => button::standard(fl!("disconnect"))
+            | State::CertUntrusted
+            | State::Reconnecting => button::standard(fl!("disconnect"))
                 .on_press(Message::Disconnect)
                 .into(),
             State::Disconnecting => button::standard(fl!("disconnect")).into(),
@@ -433,9 +443,9 @@ impl Applet {
 fn panel_icon(snapshot: Option<&Snapshot>) -> &'static str {
     match snapshot.map(|s| s.state) {
         Some(State::Disconnected) => "network-vpn-disconnected-symbolic",
-        Some(State::Connecting | State::WaitingForLogin | State::Disconnecting) => {
-            "network-vpn-acquiring-symbolic"
-        }
+        Some(
+            State::Connecting | State::WaitingForLogin | State::Disconnecting | State::Reconnecting,
+        ) => "network-vpn-acquiring-symbolic",
         Some(State::Connected) => "network-vpn-symbolic",
         Some(State::CertUntrusted | State::Failed) | None => "network-vpn-error-symbolic",
     }
@@ -450,6 +460,7 @@ fn status_text(snapshot: Option<&Snapshot>) -> String {
         Some(State::Connecting | State::WaitingForLogin) => fl!("status-connecting"),
         Some(State::Connected) => fl!("status-connected"),
         Some(State::Disconnecting) => fl!("status-disconnecting"),
+        Some(State::Reconnecting) => fl!("status-reconnecting"),
         Some(State::CertUntrusted) => fl!("status-cert-untrusted"),
         // A tunnel that went down is interrupted, not a failed attempt.
         Some(State::Failed) => match snapshot.map(|s| s.failure.as_str()) {

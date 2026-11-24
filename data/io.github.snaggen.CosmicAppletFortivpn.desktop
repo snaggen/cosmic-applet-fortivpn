@@ -1,12 +1,12 @@
 [Desktop Entry]
-Name=Fortinet VPN
-Comment=Connect to a Fortinet SSL VPN from the panel
-Comment[sv]=Anslut till ett Fortinet SSL-VPN från panelen
+Name=OpenFortiVPN
+Comment=Connect to a Fortinet SSL VPN with openfortivpn from the panel
+Comment[sv]=Anslut till ett Fortinet SSL-VPN med openfortivpn från panelen
 Type=Application
 Exec=cosmic-applet-fortivpn
 Terminal=false
 Categories=COSMIC;
-Keywords=COSMIC;Applet;VPN;Fortinet;FortiGate;
+Keywords=COSMIC;Applet;VPN;Fortinet;FortiGate;openfortivpn;
 Icon=network-vpn-symbolic
 StartupNotify=true
 NoDisplay=true

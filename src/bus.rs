@@ -39,6 +39,8 @@ pub enum State {
     Disconnecting,
     CertUntrusted,
     Failed,
+    /// The tunnel went down and the agent reconnects by itself.
+    Reconnecting,
 }
 
 impl State {
@@ -51,6 +53,7 @@ impl State {
             Self::Disconnecting => "disconnecting",
             Self::CertUntrusted => "cert-untrusted",
             Self::Failed => "failed",
+            Self::Reconnecting => "reconnecting",
         }
     }
 
@@ -63,6 +66,7 @@ impl State {
             "connected" => Self::Connected,
             "disconnecting" => Self::Disconnecting,
             "cert-untrusted" => Self::CertUntrusted,
+            "reconnecting" => Self::Reconnecting,
             _ => Self::Failed,
         }
     }
@@ -91,6 +95,8 @@ pub struct Snapshot {
     /// A configure helper runs (waiting for the admin password).
     pub configuring: bool,
     pub configure_error: String,
+    /// The setting: reconnect by itself after the tunnel went down or after sleep.
+    pub auto_reconnect: bool,
 }
 
 impl Snapshot {
@@ -147,7 +153,18 @@ impl Snapshot {
             failure_detail,
             configuring,
             configure_error: configure_error.unwrap_or_default().to_owned(),
+            auto_reconnect: false,
         }
+    }
+
+    /// Adds the reconnect setting, and shows `Reconnecting` while a reconnect runs and the
+    /// tunnel is not up.
+    pub fn with_reconnect(mut self, reconnecting: bool, auto_reconnect: bool) -> Self {
+        self.auto_reconnect = auto_reconnect;
+        if reconnecting && self.state != State::Connected {
+            self.state = State::Reconnecting;
+        }
+        self
     }
 
     /// Builds a snapshot from the agent's properties (`GetAll`). Missing or mistyped
@@ -185,6 +202,10 @@ impl Snapshot {
                 .and_then(|v| bool::try_from(v).ok())
                 .unwrap_or_default(),
             configure_error: string("ConfigureError"),
+            auto_reconnect: props
+                .get("AutoReconnect")
+                .and_then(|v| bool::try_from(v).ok())
+                .unwrap_or_default(),
         }
     }
 }
@@ -219,6 +240,7 @@ pub enum AgentCommand {
     Disconnect,
     SetGateway(String),
     ForgetCert,
+    SetAutoReconnect(bool),
 }
 
 /// The agent's D-Bus object.
@@ -251,6 +273,16 @@ impl AgentInterface {
     /// `SetGateway`.
     fn forget_cert(&self) {
         let _ = self.commands.send(AgentCommand::ForgetCert);
+    }
+
+    /// Turns reconnecting by itself on or off. A user setting: no password needed.
+    fn set_auto_reconnect(&self, enabled: bool) {
+        let _ = self.commands.send(AgentCommand::SetAutoReconnect(enabled));
+    }
+
+    #[zbus(property)]
+    fn auto_reconnect(&self) -> bool {
+        self.snapshot.auto_reconnect
     }
 
     #[zbus(property)]
@@ -369,6 +401,9 @@ async fn publish(iface: &InterfaceRef<AgentInterface>, new: Snapshot) -> zbus::R
     if old.configuring != new.configuring {
         guard.configuring_changed(emitter).await?;
     }
+    if old.auto_reconnect != new.auto_reconnect {
+        guard.auto_reconnect_changed(emitter).await?;
+    }
     if old.configure_error != new.configure_error {
         guard.configure_error_changed(emitter).await?;
     }
@@ -469,6 +504,7 @@ pub trait Agent {
     fn disconnect(&self) -> zbus::Result<()>;
     fn set_gateway(&self, address: &str) -> zbus::Result<()>;
     fn forget_cert(&self) -> zbus::Result<()>;
+    fn set_auto_reconnect(&self, enabled: bool) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -486,6 +522,7 @@ mod tests {
             State::Disconnecting,
             State::CertUntrusted,
             State::Failed,
+            State::Reconnecting,
         ] {
             assert_eq!(State::parse(state.as_str()), state);
         }
@@ -535,6 +572,36 @@ mod tests {
         assert_eq!(connected.trusted_cert, "");
         assert!(connected.connected_since > 0);
         assert_eq!(connected.gateway, "");
+    }
+
+    #[test]
+    fn reconnecting_shows_until_connected() {
+        let failed = Snapshot::new(
+            &Status::Failed(Failure::Lost),
+            &Ok(None),
+            false,
+            None,
+            None,
+            Traffic::default(),
+        );
+        let shown = failed.clone().with_reconnect(true, true);
+        assert_eq!(shown.state, State::Reconnecting);
+        assert!(shown.auto_reconnect);
+        assert_eq!(
+            failed.clone().with_reconnect(false, true).state,
+            State::Failed
+        );
+        let connected = Snapshot::new(
+            &Status::Connected {
+                since: Instant::now(),
+            },
+            &Ok(None),
+            false,
+            None,
+            None,
+            Traffic::default(),
+        );
+        assert_eq!(connected.with_reconnect(true, true).state, State::Connected);
     }
 
     #[test]

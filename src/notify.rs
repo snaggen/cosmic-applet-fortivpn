@@ -45,7 +45,7 @@ pub async fn show(notification: Notification, desktop_entry: &str) -> Result<(),
         ]);
         proxy
             .notify(
-                "VPN",
+                "OpenFortiVPN",
                 0,
                 "network-vpn-error-symbolic",
                 &notification.summary,
