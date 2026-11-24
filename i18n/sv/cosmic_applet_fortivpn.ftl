@@ -6,6 +6,7 @@ status-connected = Ansluten
 status-disconnecting = Kopplar från…
 status-cert-untrusted = Certifikatet är inte betrott
 status-failed = Anslutningen misslyckades
+status-interrupted = Anslutningen avbröts
 status-unavailable = Inte tillgänglig
 
 connect = Anslut
@@ -29,6 +30,7 @@ error-not-configured = Ingen VPN-gateway är inställd.
 error-busy = En annan VPN-anslutning körs redan.
 error-auth-failed = Gatewayen avvisade inloggningen.
 error-not-authorized = Saknar behörighet att starta VPN:et: { $reason }
+error-lost = VPN-anslutningen slutade svara, troligen för att nätverket ändrades.
 error-stopped = VPN-anslutningen avbröts oväntat.
 error-other = VPN:et kunde inte startas: { $reason }
 

@@ -10,8 +10,10 @@
 use crate::{
     bus::{self, AgentCommand, BusUpdate, Snapshot},
     fl,
+    liveness::{self, STALL_BEFORE_PROBE, STALL_WITHOUT_PROBE, Watch},
     login::{self, LoginResult},
     notify::{self, Notification},
+    sleep::{self, SleepUpdate},
     state::{Effect, Failure, Status},
     stats::{Counters, Meter, Traffic},
     tunnel::{self, TunnelCommand},
@@ -34,7 +36,10 @@ use cosmic_applet_fortivpn::{
     openfortivpn::TunnelDetail,
     protocol::{Event, UntrustedCert},
 };
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 const APP_ID: &str = "io.github.snaggen.CosmicAppletFortivpn";
@@ -88,6 +93,13 @@ struct Agent {
     address: Option<String>,
     meter: Meter,
     traffic: Traffic,
+    /// The VPN's DNS servers, for probing whether the tunnel still works.
+    nameservers: Vec<IpAddr>,
+    watch: Watch,
+    probing: bool,
+    /// Holds or releases logind's sleep inhibitor.
+    sleep_lock: Option<UnboundedSender<bool>>,
+    holding_sleep: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +121,9 @@ enum Message {
     LoginFinished(LoginResult),
     /// Time to read the traffic counters.
     TrafficTick,
+    /// Whether the tunnel answered a probe.
+    Probed(bool),
+    Sleep(SleepUpdate),
     Notified(Result<(), String>),
     /// The SAML id was handed to openfortivpn, or could not be.
     HandedOver(Result<(), String>),
@@ -147,6 +162,11 @@ impl cosmic::Application for Agent {
             address: None,
             meter: Meter::default(),
             traffic: Traffic::default(),
+            nameservers: Vec::new(),
+            watch: Watch::default(),
+            probing: false,
+            sleep_lock: None,
+            holding_sleep: false,
         };
         (agent, Task::none())
     }
@@ -157,6 +177,7 @@ impl cosmic::Application for Agent {
             bus::serve().map(Message::Bus),
             window::close_events().map(Message::WindowClosed),
             self.traffic_ticks(),
+            sleep::subscription().map(Message::Sleep),
         ])
     }
 
@@ -179,6 +200,7 @@ impl cosmic::Application for Agent {
             notification = self.notify_failure(&before);
         }
         self.end_login_if_done();
+        self.sync_sleep_lock();
         self.publish();
         Task::batch([task, self.sync_dialog(), notification])
     }
@@ -251,13 +273,15 @@ impl Agent {
                 let effect = self.status.on_login(result);
                 return self.run(effect);
             }
-            Message::TrafficTick => self.read_traffic(),
+            Message::TrafficTick => return self.read_traffic(),
+            Message::Probed(alive) => return self.on_probed(alive),
+            Message::Sleep(update) => return self.on_sleep(update),
             Message::Notified(Err(err)) => tracing::warn!(%err, "could not show a notification"),
             Message::Notified(Ok(())) => {}
             Message::HandedOver(Ok(())) => {}
             Message::HandedOver(Err(why)) => {
                 tracing::warn!(%why, "could not hand the login to openfortivpn");
-                let effect = self.status.fail(why);
+                let effect = self.status.fail(Failure::Other(why));
                 return self.run(effect);
             }
             Message::WindowClosed(id) => {
@@ -337,14 +361,100 @@ impl Agent {
         }
     }
 
-    fn read_traffic(&mut self) {
+    /// Reads the counters for the statistics and checks whether the tunnel stalls.
+    fn read_traffic(&mut self) -> Task<cosmic::Action<Message>> {
         let Some(interface) = &self.interface else {
-            return;
+            return Task::none();
         };
-        match Counters::read(interface) {
-            Ok(counters) => self.traffic = self.meter.sample(Instant::now(), counters),
+        let counters = match Counters::read(interface) {
+            Ok(counters) => counters,
             // The interface goes away when the tunnel drops; openfortivpn reports that.
-            Err(err) => tracing::debug!(%err, interface, "could not read the traffic counters"),
+            Err(err) => {
+                tracing::debug!(%err, interface, "could not read the traffic counters");
+                return Task::none();
+            }
+        };
+        let now = Instant::now();
+        self.traffic = self.meter.sample(now, counters);
+        match self.watch.update(now, counters) {
+            Some(stalled) if self.nameservers.is_empty() && stalled >= STALL_WITHOUT_PROBE => {
+                tracing::warn!(?stalled, "tunnel stalled, no DNS server to probe");
+                self.lose_tunnel()
+            }
+            Some(stalled) if stalled >= STALL_BEFORE_PROBE => self.probe(),
+            _ => Task::none(),
+        }
+    }
+
+    /// Asks the VPN's DNS servers whether the tunnel still carries traffic.
+    fn probe(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.probing || self.nameservers.is_empty() {
+            return Task::none();
+        }
+        tracing::info!("probing the tunnel");
+        self.probing = true;
+        let servers = self.nameservers.clone();
+        cosmic::task::future(async move { Message::Probed(liveness::probe(servers).await) })
+    }
+
+    fn on_probed(&mut self, alive: bool) -> Task<cosmic::Action<Message>> {
+        self.probing = false;
+        if alive {
+            tracing::info!("tunnel answered the probe");
+            self.watch.reset();
+            Task::none()
+        } else {
+            tracing::warn!("tunnel did not answer the probe");
+            self.lose_tunnel()
+        }
+    }
+
+    /// The tunnel is dead: stop it and report it lost.
+    fn lose_tunnel(&mut self) -> Task<cosmic::Action<Message>> {
+        if !matches!(self.status, Status::Connected { .. }) {
+            return Task::none();
+        }
+        let effect = self.status.fail(Failure::Lost);
+        self.run(effect)
+    }
+
+    fn on_sleep(&mut self, update: SleepUpdate) -> Task<cosmic::Action<Message>> {
+        match update {
+            SleepUpdate::Ready(lock) => {
+                self.sleep_lock = Some(lock);
+                self.holding_sleep = false;
+            }
+            SleepUpdate::Suspending => {
+                tracing::info!(status = ?self.status, "system is going to sleep");
+                // The lock is released once the tunnel is down (sync_sleep_lock).
+                let effect = self.status.disconnect();
+                return self.run(effect);
+            }
+            SleepUpdate::Resumed => {
+                tracing::info!(status = ?self.status, "system resumed");
+                // Still up means the disconnect before sleep did not happen in time.
+                if matches!(self.status, Status::Connected { .. }) {
+                    return self.probe();
+                }
+            }
+            SleepUpdate::Failed(err) => {
+                tracing::warn!(%err, "logind unavailable, sleep is not handled");
+            }
+        }
+        Task::none()
+    }
+
+    /// Holds logind's sleep inhibitor while a connection runs, so sleep waits for the
+    /// disconnect.
+    fn sync_sleep_lock(&mut self) {
+        let wanted = self.status.is_active();
+        if wanted == self.holding_sleep {
+            return;
+        }
+        if let Some(lock) = &self.sleep_lock
+            && lock.send(wanted).is_ok()
+        {
+            self.holding_sleep = wanted;
         }
     }
 
@@ -353,6 +463,7 @@ impl Agent {
         match TunnelDetail::parse(line) {
             Some(TunnelDetail::Interface(name)) => self.interface = Some(name),
             Some(TunnelDetail::LocalAddress(address)) => self.address = Some(address),
+            Some(TunnelDetail::Nameservers(servers)) => self.nameservers = servers,
             None => {}
         }
     }
@@ -363,6 +474,9 @@ impl Agent {
         self.address = None;
         self.meter = Meter::default();
         self.traffic = Traffic::default();
+        self.nameservers.clear();
+        self.watch = Watch::default();
+        self.probing = false;
     }
 
     /// Notifies when the connection fails, since the popover is usually closed then. A

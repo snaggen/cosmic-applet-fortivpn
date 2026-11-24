@@ -51,6 +51,8 @@ pub enum Failure {
     NotAuthorized(String),
     /// The tunnel or the helper stopped without being asked to.
     Stopped,
+    /// The tunnel stopped carrying traffic (the network under it went away).
+    Lost,
     Other(String),
 }
 
@@ -137,12 +139,12 @@ impl Status {
         Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
     }
 
-    /// Something the agent did for the connection failed: give up and stop the helper.
-    pub fn fail(&mut self, why: String) -> Effect {
+    /// The agent found the connection broken: give up and stop the helper.
+    pub fn fail(&mut self, failure: Failure) -> Effect {
         if !self.is_active() {
             return Effect::None;
         }
-        *self = Self::Failed(Failure::Other(why));
+        *self = Self::Failed(failure);
         Effect::Send(TunnelCommand::Disconnect)
     }
 
@@ -321,14 +323,14 @@ mod tests {
     fn failed_handover_stops_the_helper() {
         let mut status = Status::WaitingForLogin;
         assert_eq!(
-            status.fail("refused".into()),
+            status.fail(Failure::Other("refused".into())),
             Effect::Send(TunnelCommand::Disconnect)
         );
         assert_eq!(status, Status::Failed(Failure::Other("refused".into())));
         // The helper's exit keeps the failure shown.
         status.on_event(Event::Exited(Some(1)), Instant::now());
         assert_eq!(status, Status::Failed(Failure::Other("refused".into())));
-        assert_eq!(Status::Disconnected.fail("x".into()), Effect::None);
+        assert_eq!(Status::Disconnected.fail(Failure::Lost), Effect::None);
     }
 
     #[test]

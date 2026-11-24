@@ -128,10 +128,13 @@ pub enum TunnelDetail {
     Interface(String),
     /// The tunnel's local IP address.
     LocalAddress(String),
+    /// The VPN's DNS servers, reached through the tunnel.
+    Nameservers(Vec<std::net::IpAddr>),
 }
 
 impl TunnelDetail {
-    /// Recognises pppd's `Using interface ppp0` and `local  IP address 192.0.2.1`.
+    /// Recognises pppd's `Using interface ppp0` and `local  IP address 192.0.2.1`, and
+    /// openfortivpn's `Got addresses: [192.0.2.1], ns [192.0.2.53]`.
     ///
     /// ```
     /// use cosmic_applet_fortivpn::openfortivpn::TunnelDetail;
@@ -156,6 +159,14 @@ impl TunnelDetail {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
             return valid.then(|| Self::Interface(name.to_owned()));
+        }
+        if let Some(rest) = text.strip_prefix("Got addresses: ") {
+            let list = rest.split_once("ns [")?.1.split(']').next()?;
+            let servers: Vec<_> = list
+                .split(',')
+                .filter_map(|server| server.trim().parse().ok())
+                .collect();
+            return (!servers.is_empty()).then_some(Self::Nameservers(servers));
         }
         let address = text.strip_prefix("local")?.trim_start();
         let address = address.strip_prefix("IP address")?.trim();
@@ -300,6 +311,19 @@ ERROR:          {DIGEST}
         assert_eq!(TunnelDetail::parse("local  IP address nonsense"), None);
         assert_eq!(
             TunnelDetail::parse("INFO:   Tunnel is up and running."),
+            None
+        );
+        assert_eq!(
+            TunnelDetail::parse(
+                "INFO:   Got addresses: [192.168.77.13], ns [172.26.0.11, 172.28.0.11]"
+            ),
+            Some(TunnelDetail::Nameservers(vec![
+                "172.26.0.11".parse().unwrap(),
+                "172.28.0.11".parse().unwrap()
+            ]))
+        );
+        assert_eq!(
+            TunnelDetail::parse("INFO:   Got addresses: [192.168.77.13], ns [0.0.0.0x]"),
             None
         );
     }

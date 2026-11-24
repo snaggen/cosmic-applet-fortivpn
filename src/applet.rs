@@ -451,7 +451,11 @@ fn status_text(snapshot: Option<&Snapshot>) -> String {
         Some(State::Connected) => fl!("status-connected"),
         Some(State::Disconnecting) => fl!("status-disconnecting"),
         Some(State::CertUntrusted) => fl!("status-cert-untrusted"),
-        Some(State::Failed) => fl!("status-failed"),
+        // A tunnel that went down is interrupted, not a failed attempt.
+        Some(State::Failed) => match snapshot.map(|s| s.failure.as_str()) {
+            Some("lost" | "stopped") => fl!("status-interrupted"),
+            _ => fl!("status-failed"),
+        },
     }
 }
 
@@ -464,6 +468,7 @@ pub(crate) fn failure_text(snapshot: &Snapshot) -> String {
         "auth-failed" => fl!("error-auth-failed"),
         "not-authorized" => fl!("error-not-authorized", reason = reason),
         "stopped" => fl!("error-stopped"),
+        "lost" => fl!("error-lost"),
         _ => fl!("error-other", reason = reason),
     }
 }
