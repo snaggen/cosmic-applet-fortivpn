@@ -13,6 +13,7 @@ mod client;
 mod liveness;
 mod localize;
 mod login;
+mod netwatch;
 mod notify;
 mod reconnect;
 mod sleep;

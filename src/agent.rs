@@ -12,6 +12,7 @@ use crate::{
     fl,
     liveness::{self, STALL_BEFORE_PROBE, STALL_WITHOUT_PROBE, Watch},
     login::{self, LoginResult},
+    netwatch::{self, Change},
     notify::{self, Notification},
     reconnect::{self, Reconnect},
     sleep::{self, SleepUpdate},
@@ -149,6 +150,8 @@ enum Message {
     /// Whether the tunnel answered a probe.
     Probed(bool),
     Sleep(SleepUpdate),
+    /// Links, addresses or routes changed.
+    Network(Change),
     /// Time for an attempt of reconnect `id`; `false` if the network did not come back.
     Reconnect {
         id: u64,
@@ -220,6 +223,7 @@ impl cosmic::Application for Agent {
             window::close_events().map(Message::WindowClosed),
             self.traffic_ticks(),
             sleep::subscription().map(Message::Sleep),
+            netwatch::subscription().map(Message::Network),
         ])
     }
 
@@ -326,6 +330,7 @@ impl Agent {
             Message::TrafficTick => return self.read_traffic(),
             Message::Probed(alive) => return self.on_probed(alive),
             Message::Sleep(update) => return self.on_sleep(update),
+            Message::Network(change) => return self.on_network_change(&change),
             Message::Reconnect { id, network } => return self.attempt_reconnect(id, network),
             Message::Notified(Err(err)) => tracing::warn!(%err, "could not show a notification"),
             Message::Notified(Ok(())) => {}
@@ -440,6 +445,20 @@ impl Agent {
             Some(stalled) if stalled >= STALL_BEFORE_PROBE => self.probe(),
             _ => Task::none(),
         }
+    }
+
+    /// Probes the tunnel when the network under it changed: an idle tunnel would otherwise
+    /// only be found dead when it is next used.
+    fn on_network_change(&mut self, change: &Change) -> Task<cosmic::Action<Message>> {
+        if !matches!(self.status, Status::Connected { .. }) {
+            return Task::none();
+        }
+        let tunnel = self.interface.as_deref().and_then(interface_index);
+        if !change.besides(tunnel) {
+            return Task::none();
+        }
+        tracing::info!(?change, "network changed");
+        self.probe()
     }
 
     /// Asks the VPN's DNS servers whether the tunnel still carries traffic.
@@ -1031,6 +1050,14 @@ async fn run_configure(args: &[String]) -> Result<(), String> {
         _ if stderr.is_empty() => Err(format!("{}", output.status)),
         _ => Err(stderr),
     }
+}
+
+/// The kernel's index of a network interface (a name checked by `TunnelDetail`).
+fn interface_index(name: &str) -> Option<u32> {
+    let path = std::path::Path::new("/sys/class/net")
+        .join(name)
+        .join("ifindex");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 #[cfg(test)]
