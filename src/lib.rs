@@ -11,6 +11,7 @@
 //! The helper takes nothing from the caller but the login (a cookie or SAML login), so the
 //! gateway and the trusted certificate are only ever changed by an admin.
 
+pub mod certcheck;
 pub mod gateway;
 pub mod openfortivpn;
 pub mod protocol;

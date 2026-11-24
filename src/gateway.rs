@@ -161,6 +161,11 @@ impl CertDigest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The digest of a SHA-256 hash, in openfortivpn's lowercase hex form.
+    pub fn from_sha256(hash: [u8; 32]) -> Self {
+        Self(hash.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
 }
 
 impl FromStr for CertDigest {
