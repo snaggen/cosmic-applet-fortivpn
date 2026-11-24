@@ -85,13 +85,15 @@ impl Status {
                 *self = Self::WaitingForLogin;
                 return Effect::OpenLoginPage;
             }
+            // The login is done; the login dialog closes while the tunnel comes up.
+            Event::SamlReceived if *self == Self::WaitingForLogin => *self = Self::Connecting,
             Event::Up if self.is_active() => *self = Self::Connected { since: now },
             Event::CertUntrusted(cert) => *self = Self::CertUntrusted(cert),
             Event::AuthFailed => *self = Self::Failed(Failure::AuthFailed),
             Event::Error(err) => *self = Self::Failed(failure_from(err)),
             Event::Exited(_) => self.on_exit(),
             Event::Log(line) => tracing::debug!(%line, "openfortivpn"),
-            Event::SamlReady | Event::Up => {}
+            Event::SamlReady | Event::SamlReceived | Event::Up => {}
         }
         Effect::None
     }
@@ -167,6 +169,8 @@ mod tests {
             Effect::OpenLoginPage
         );
         assert_eq!(status, Status::WaitingForLogin);
+        status.on_event(Event::SamlReceived, now);
+        assert_eq!(status, Status::Connecting);
         status.on_event(Event::Up, now);
         assert_eq!(status, Status::Connected { since: now });
         assert_eq!(status.disconnect(), Effect::Send(TunnelCommand::Disconnect));
@@ -175,6 +179,17 @@ mod tests {
         assert_eq!(status, Status::Disconnected);
         status.on_ended(&ended(0, ""));
         assert_eq!(status, Status::Disconnected);
+    }
+
+    #[test]
+    fn saml_received_only_ends_the_wait_for_login() {
+        let now = Instant::now();
+        let mut status = Status::Disconnected;
+        status.on_event(Event::SamlReceived, now);
+        assert_eq!(status, Status::Disconnected);
+        let mut status = Status::Connected { since: now };
+        status.on_event(Event::SamlReceived, now);
+        assert_eq!(status, Status::Connected { since: now });
     }
 
     #[test]

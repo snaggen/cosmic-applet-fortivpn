@@ -110,6 +110,8 @@ pub enum HelperError {
 pub enum Event {
     /// openfortivpn waits for the SAML redirect; the applet opens the login page now.
     SamlReady,
+    /// The browser delivered the SAML login to openfortivpn; the login page is done.
+    SamlReceived,
     /// The tunnel is up.
     Up,
     /// The gateway certificate does not validate and is not trusted.
@@ -129,6 +131,7 @@ impl Event {
     pub fn to_line(&self) -> String {
         let fields: Vec<String> = match self {
             Self::SamlReady => vec!["saml-ready".into()],
+            Self::SamlReceived => vec!["saml-received".into()],
             Self::Up => vec!["up".into()],
             Self::CertUntrusted(cert) => vec![
                 "cert-untrusted".into(),
@@ -167,6 +170,7 @@ impl Event {
         let fields: Vec<&str> = line.split('\t').collect();
         let event = match fields.as_slice() {
             ["saml-ready"] => Self::SamlReady,
+            ["saml-received"] => Self::SamlReceived,
             ["up"] => Self::Up,
             ["cert-untrusted", digest, subject, issuer] => Self::CertUntrusted(UntrustedCert {
                 digest: digest.parse().ok()?,
@@ -241,6 +245,7 @@ mod tests {
     fn events_round_trip() {
         let events = [
             Event::SamlReady,
+            Event::SamlReceived,
             Event::Up,
             Event::CertUntrusted(UntrustedCert {
                 digest: DIGEST.parse().unwrap(),

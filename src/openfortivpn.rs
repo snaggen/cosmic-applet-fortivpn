@@ -71,6 +71,8 @@ impl OutputParser {
 
         let event = if text.starts_with("Listening for SAML login") {
             Event::SamlReady
+        } else if text.starts_with("Processing HTTP SAML request") {
+            Event::SamlReceived
         } else if text.starts_with("Tunnel is up and running") {
             Event::Up
         } else if text.starts_with("Could not authenticate to gateway") {
@@ -167,6 +169,7 @@ mod tests {
         let output = "\
 INFO:   Listening for SAML login on port 8020
 INFO:   Authenticate at 'https://vpn.example.com:10443/remote/saml/start?redirect=1'
+INFO:   Processing HTTP SAML request
 INFO:   Interface ppp0 is UP.
 INFO:   Tunnel is up and running.
 ";
@@ -178,6 +181,7 @@ INFO:   Tunnel is up and running.
                     "INFO:   Authenticate at 'https://vpn.example.com:10443/remote/saml/start?redirect=1'"
                         .into()
                 ),
+                Event::SamlReceived,
                 Event::Log("INFO:   Interface ppp0 is UP.".into()),
                 Event::Up,
             ]
