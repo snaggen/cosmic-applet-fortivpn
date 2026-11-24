@@ -5,7 +5,8 @@
 //! Reads one request line from stdin (the only input taken from the caller), runs openfortivpn
 //! against the gateway in the root-owned config, and reports events on stdout. When stdin
 //! closes, because the applet disconnects or exits, openfortivpn is stopped with SIGTERM so it
-//! can restore routes and DNS.
+//! can restore routes and DNS. Its last step, logging out at the gateway, can hang when the
+//! network is gone; once the rest is done it gets [`LOGOUT_GRACE`], then SIGKILL.
 //!
 //! This runs as root: it must not panic, and it never passes caller input to openfortivpn
 //! other than the validated cookie.
@@ -28,10 +29,21 @@ use std::{
     process::{Child, ChildStdin, Command, ExitCode, Stdio},
     sync::mpsc,
     thread,
+    time::{Duration, Instant},
 };
 
 /// Upper bound for the request line; a cookie is at most 4000 bytes.
 const MAX_REQUEST_LEN: u64 = 8192;
+
+/// How long openfortivpn may take to log out at the gateway after it restored routes and DNS.
+const LOGOUT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long openfortivpn may take to stop at all after SIGTERM.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// openfortivpn's line once routes, DNS and the tunnel are cleaned up; only the logout at the
+/// gateway follows.
+const CLEANED_UP: &str = "Closed connection to gateway";
 
 /// What the main loop waits for.
 enum Input {
@@ -241,37 +253,117 @@ fn watch_stdin(mut stdin: impl Read + Send + 'static, tx: mpsc::Sender<Input>) {
 /// applet disconnects, or when it is stuck after an error it does not exit on by itself.
 fn supervise(child: &mut Child, rx: &mpsc::Receiver<Input>, events: &mut Events) {
     let mut parser = OutputParser::default();
+    let mut stop = Stop::default();
     let mut open_streams = 2;
-    let mut terminated = false;
-    let mut terminate = |child: &Child| {
-        if !terminated {
-            terminated = true;
-            let _ = kill_process(Pid::from_child(child), Signal::TERM);
-        }
-    };
 
     while open_streams > 0 {
-        match rx.recv() {
-            Ok(Input::Line(line)) => {
+        let input = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(input) => input,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stop.kill_due(Instant::now()) {
+                    let _ = kill_process(Pid::from_child(child), Signal::KILL);
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        match input {
+            Input::Line(line) => {
+                stop.saw_line(&line, Instant::now());
                 let Some(event) = parser.parse_line(&line) else {
                     continue;
                 };
                 let fatal = matches!(event, Event::CertUntrusted(_) | Event::AuthFailed);
                 events.send(&event);
-                if fatal {
-                    terminate(child);
+                if fatal && stop.ask(Instant::now()) {
+                    let _ = kill_process(Pid::from_child(child), Signal::TERM);
                 }
             }
-            Ok(Input::OutputClosed) => open_streams -= 1,
-            Ok(Input::StdinClosed) => terminate(child),
-            Err(mpsc::RecvError) => break,
+            Input::OutputClosed => open_streams -= 1,
+            Input::StdinClosed => {
+                if stop.ask(Instant::now()) {
+                    let _ = kill_process(Pid::from_child(child), Signal::TERM);
+                }
+            }
         }
+    }
+}
+
+/// Stopping openfortivpn: SIGTERM first, SIGKILL if it hangs after that.
+#[derive(Debug, Default)]
+struct Stop {
+    asked_at: Option<Instant>,
+    cleaned_up_at: Option<Instant>,
+    killed: bool,
+}
+
+impl Stop {
+    /// Records the request to stop; `true` the first time, when SIGTERM is to be sent.
+    fn ask(&mut self, now: Instant) -> bool {
+        if self.asked_at.is_some() {
+            return false;
+        }
+        self.asked_at = Some(now);
+        true
+    }
+
+    /// Notes openfortivpn's line saying it cleaned up.
+    fn saw_line(&mut self, line: &str, now: Instant) {
+        if self.asked_at.is_some() && self.cleaned_up_at.is_none() && line.contains(CLEANED_UP) {
+            self.cleaned_up_at = Some(now);
+        }
+    }
+
+    /// Whether to send SIGKILL now: the logout hangs after the cleanup, or the whole stop takes
+    /// too long. Answers `true` once.
+    fn kill_due(&mut self, now: Instant) -> bool {
+        let Some(asked) = self.asked_at else {
+            return false;
+        };
+        let logout_hangs = self
+            .cleaned_up_at
+            .is_some_and(|cleaned| now.saturating_duration_since(cleaned) >= LOGOUT_GRACE);
+        let too_long = now.saturating_duration_since(asked) >= STOP_TIMEOUT;
+        if self.killed || !(logout_hangs || too_long) {
+            return false;
+        }
+        self.killed = true;
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_after_a_hanging_logout() {
+        let t0 = Instant::now();
+        let s = |n| t0 + Duration::from_secs(n);
+        let mut stop = Stop::default();
+        // Lines before the stop was asked for do not count.
+        stop.saw_line("INFO:   Closed connection to gateway.", s(0));
+        assert!(stop.ask(s(1)));
+        assert!(!stop.ask(s(1)), "SIGTERM only once");
+        assert!(!stop.kill_due(s(10)));
+        stop.saw_line("INFO:   Closed connection to gateway.\n", s(10));
+        assert!(!stop.kill_due(s(12)));
+        assert!(stop.kill_due(s(13)));
+        assert!(!stop.kill_due(s(14)), "SIGKILL only once");
+    }
+
+    #[test]
+    fn kill_when_stopping_takes_too_long() {
+        let t0 = Instant::now();
+        let mut stop = Stop::default();
+        assert!(
+            !stop.kill_due(t0 + STOP_TIMEOUT),
+            "nothing to kill before a stop"
+        );
+        stop.ask(t0);
+        assert!(!stop.kill_due(t0 + STOP_TIMEOUT - Duration::from_secs(1)));
+        assert!(stop.kill_due(t0 + STOP_TIMEOUT));
+    }
 
     #[test]
     fn request_line_must_be_complete_and_valid() {
