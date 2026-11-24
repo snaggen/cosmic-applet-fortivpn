@@ -3,7 +3,18 @@
 A COSMIC panel applet for a Fortinet SSL VPN with SAML/SSO login, built on
 [openfortivpn](https://github.com/adrienverge/openfortivpn).
 
-**Status:** early skeleton. It shows a panel icon and a popover, nothing more yet.
+**Status:** connects and disconnects, with SAML login in the system browser. The embedded
+login, statistics and suspend handling are still to come.
+
+Requires `openfortivpn` (at `/usr/bin/openfortivpn`) and polkit.
+
+## How it works
+
+The applet runs as the user. openfortivpn needs root, so the applet starts
+`cosmic-applet-fortivpn-helper` through pkexec. The helper takes only the login from the
+applet; the gateway and the trusted certificate come from `/etc/cosmic-applet-fortivpn/`,
+which only `cosmic-applet-fortivpn-configure` writes, and polkit requires an admin password
+for that. Closing the helper's stdin disconnects.
 
 ## Build and install
 
@@ -11,12 +22,14 @@ Tools are pinned with [mise](https://mise.jdx.dev/):
 
 ```sh
 mise install
-just check      # fmt, clippy, tests
-just install    # into ~/.local; override with: just prefix=/usr/local install
-                # the installed desktop entry gets the absolute binary path
+just check            # fmt, clippy, tests
+just install-helper   # root helpers and polkit policy, through sudo
+just install          # applet into ~/.local; override with: just prefix=/usr/local install
 ```
 
-Then add the applet to the panel in COSMIC Settings → Desktop → Panel → Applets.
+The installed desktop entry gets the absolute binary path, since the panel's PATH may not
+contain the prefix. Then add the applet to the panel in COSMIC Settings → Desktop → Panel →
+Applets.
 
 ## Translations
 
