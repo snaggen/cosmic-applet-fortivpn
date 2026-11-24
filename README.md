@@ -13,6 +13,7 @@ Tools are pinned with [mise](https://mise.jdx.dev/):
 mise install
 just check      # fmt, clippy, tests
 just install    # into ~/.local; override with: just prefix=/usr/local install
+                # the installed desktop entry gets the absolute binary path
 ```
 
 Then add the applet to the panel in COSMIC Settings → Desktop → Panel → Applets.

@@ -1,7 +1,8 @@
 name := 'cosmic-applet-fortivpn'
 appid := 'io.github.snaggen.CosmicAppletFortivpn'
 
-# Install prefix. The default needs ~/.local/bin on the session's PATH.
+# Install prefix. The desktop entry gets the absolute binary path, since the
+# panel's PATH need not contain the prefix (it lacks ~/.local/bin by default).
 prefix := env_var('HOME') / '.local'
 bin-dst := prefix / 'bin' / name
 desktop-dst := prefix / 'share' / 'applications' / appid + '.desktop'
@@ -19,7 +20,9 @@ check:
 
 install: build-release
     install -Dm0755 target/release/{{name}} {{bin-dst}}
-    install -Dm0644 data/{{appid}}.desktop {{desktop-dst}}
+    install -d {{parent_directory(desktop-dst)}}
+    sed 's|^Exec=.*|Exec={{bin-dst}}|' data/{{appid}}.desktop > {{desktop-dst}}
+    chmod 0644 {{desktop-dst}}
 
 uninstall:
     rm -f {{bin-dst}} {{desktop-dst}}
