@@ -7,6 +7,7 @@ status-connected = Ansluten
 status-disconnecting = Kopplar från…
 status-cert-untrusted = Certifikatet är inte betrott
 status-failed = Anslutningen misslyckades
+status-unavailable = Inte tillgänglig
 
 connect = Anslut
 disconnect = Koppla från
@@ -24,7 +25,6 @@ cert-untrusted-body = Certifikatet för { $host } kunde inte verifieras. Lita ba
 cert-subject = Utfärdat till
 cert-issuer = Utfärdat av
 cert-fingerprint = SHA-256-fingeravtryck
-trust-and-connect = Lita på och anslut
 
 error-not-configured = Ingen VPN-gateway är inställd.
 error-busy = En annan VPN-anslutning körs redan.
@@ -32,3 +32,13 @@ error-auth-failed = Gatewayen avvisade inloggningen.
 error-not-authorized = Saknar behörighet att starta VPN:et: { $reason }
 error-stopped = VPN-anslutningen avbröts oväntat.
 error-other = VPN:et kunde inte startas: { $reason }
+
+agent-unavailable = VPN-tjänsten körs inte.
+cert-untrusted-hint = Ta ställning till gatewayens certifikat i dialogrutan.
+waiting-for-login-hint = Slutför inloggningen i webbläsaren.
+always-trust = Lita alltid på det här certifikatet
+trust = Lita på
+
+login-dialog-title = Logga in på VPN:et
+login-dialog-body = Logga in på { $host } i webbläsaren. Fönstret stängs när du har loggat in.
+open-login-page = Öppna inloggningssidan

@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.snaggen.CosmicAppletFortivpn
+# @BIN@ is replaced by `just install` with the absolute path of the binary.
+Exec=@BIN@ --agent

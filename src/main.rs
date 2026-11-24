@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! COSMIC panel applet for a Fortinet SSL VPN.
+//!
+//! One binary, two roles: without arguments it is the panel applet (one per panel output);
+//! with `--agent` it is the per-session agent that owns the tunnel and shows dialogs,
+//! started by D-Bus activation.
 
+mod agent;
 mod applet;
+mod bus;
+mod client;
 mod localize;
 mod state;
 mod tunnel;
@@ -23,5 +30,9 @@ fn main() -> cosmic::iced::Result {
 
     localize::localize();
 
-    cosmic::applet::run::<applet::Applet>(())
+    if std::env::args().nth(1).as_deref() == Some("--agent") {
+        agent::run()
+    } else {
+        cosmic::applet::run::<applet::Applet>(())
+    }
 }

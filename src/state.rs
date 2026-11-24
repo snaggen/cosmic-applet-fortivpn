@@ -14,6 +14,9 @@ const PKEXEC_NOT_AUTHORIZED: i32 = 127;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Disconnected,
+    /// The agent checks the gateway certificate before anything else, so an untrusted
+    /// certificate is asked about before the user logs in, not after.
+    Checking,
     /// The helper is starting openfortivpn.
     Connecting,
     /// openfortivpn waits for the SAML login in the browser.
@@ -44,6 +47,8 @@ pub enum Effect {
     None,
     Send(TunnelCommand),
     OpenLoginPage,
+    /// Check the gateway certificate, then report with [`Status::on_cert_checked`].
+    CheckCert,
 }
 
 impl Status {
@@ -55,10 +60,41 @@ impl Status {
         )
     }
 
+    /// Starts a connection: first the certificate check.
     pub fn connect(&mut self) -> Effect {
+        if self.is_active() || *self == Self::Checking {
+            return Effect::None;
+        }
+        *self = Self::Checking;
+        Effect::CheckCert
+    }
+
+    /// Starts the helper without a certificate check, after the user trusted the
+    /// certificate. A certificate trusted once is only known to the helper, so a new check
+    /// would ask again.
+    pub fn connect_trusted(&mut self) -> Effect {
         if self.is_active() {
             return Effect::None;
         }
+        self.start_helper()
+    }
+
+    /// The certificate check finished: `None` if trusted (or the check could not run, in
+    /// which case openfortivpn's own check decides), otherwise the certificate to ask about.
+    pub fn on_cert_checked(&mut self, untrusted: Option<UntrustedCert>) -> Effect {
+        if *self != Self::Checking {
+            return Effect::None;
+        }
+        match untrusted {
+            None => self.start_helper(),
+            Some(cert) => {
+                *self = Self::CertUntrusted(cert);
+                Effect::None
+            }
+        }
+    }
+
+    fn start_helper(&mut self) -> Effect {
         *self = Self::Connecting;
         // Until the webview login exists (phase 4), openfortivpn takes the SAML redirect.
         Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
@@ -70,7 +106,7 @@ impl Status {
                 *self = Self::Disconnecting;
                 Effect::Send(TunnelCommand::Disconnect)
             }
-            Self::CertUntrusted(_) | Self::Failed(_) => {
+            Self::Checking | Self::CertUntrusted(_) | Self::Failed(_) => {
                 *self = Self::Disconnected;
                 Effect::None
             }
@@ -105,7 +141,7 @@ impl Status {
             Self::Connecting | Self::WaitingForLogin | Self::Connected { .. } => {
                 *self = Self::Failed(Failure::Stopped);
             }
-            Self::Disconnected | Self::CertUntrusted(_) | Self::Failed(_) => {}
+            Self::Disconnected | Self::Checking | Self::CertUntrusted(_) | Self::Failed(_) => {}
         }
     }
 
@@ -159,8 +195,10 @@ mod tests {
     fn saml_connect_and_disconnect() {
         let now = Instant::now();
         let mut status = Status::Disconnected;
+        assert_eq!(status.connect(), Effect::CheckCert);
+        assert_eq!(status, Status::Checking);
         assert_eq!(
-            status.connect(),
+            status.on_cert_checked(None),
             Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
         );
         assert_eq!(status, Status::Connecting);
@@ -190,6 +228,30 @@ mod tests {
         let mut status = Status::Connected { since: now };
         status.on_event(Event::SamlReceived, now);
         assert_eq!(status, Status::Connected { since: now });
+    }
+
+    #[test]
+    fn untrusted_cert_is_asked_before_the_login() {
+        let mut status = Status::Disconnected;
+        status.connect();
+        assert_eq!(status.on_cert_checked(Some(cert())), Effect::None);
+        assert_eq!(status, Status::CertUntrusted(cert()));
+        // After the user trusts it, the helper starts without another check.
+        assert_eq!(
+            status.connect_trusted(),
+            Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
+        );
+        assert_eq!(status, Status::Connecting);
+    }
+
+    #[test]
+    fn cancel_during_the_check_ignores_its_result() {
+        let mut status = Status::Disconnected;
+        status.connect();
+        assert_eq!(status.disconnect(), Effect::None);
+        assert_eq!(status, Status::Disconnected);
+        assert_eq!(status.on_cert_checked(None), Effect::None);
+        assert_eq!(status, Status::Disconnected);
     }
 
     #[test]

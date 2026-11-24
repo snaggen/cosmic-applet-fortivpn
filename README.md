@@ -10,8 +10,12 @@ Requires `openfortivpn` (at `/usr/bin/openfortivpn`) and polkit.
 
 ## How it works
 
-The applet runs as the user. openfortivpn needs root, so the applet starts
-`cosmic-applet-fortivpn-helper` through pkexec. The helper takes only the login from the
+The panel runs one applet per output, so the tunnel is owned by an agent instead: the same
+binary started with `--agent` through D-Bus activation, once per session. The applets show
+its state and send it Connect/Disconnect over the session bus. The agent opens a window in
+front of the user when they must act: to trust a certificate or to log in in the browser.
+
+openfortivpn needs root, so the agent starts `cosmic-applet-fortivpn-helper` through pkexec. The helper takes only the login from the
 applet; the gateway and the trusted certificate come from `/etc/cosmic-applet-fortivpn/`,
 which only `cosmic-applet-fortivpn-configure` writes, and polkit requires an admin password
 for that. Closing the helper's stdin disconnects.
