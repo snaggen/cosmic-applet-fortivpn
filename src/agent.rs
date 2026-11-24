@@ -10,6 +10,7 @@
 use crate::{
     bus::{self, AgentCommand, BusUpdate, Snapshot},
     fl,
+    login::{self, LoginResult},
     state::{Effect, Failure, Status},
     tunnel::{self, TunnelCommand},
 };
@@ -17,7 +18,7 @@ use cosmic::{
     ApplicationExt, Element, Task,
     app::Core,
     iced::{
-        Length, Size, Subscription,
+        Length, Size, Subscription, task,
         widget::{column, row, space::horizontal as horizontal_space},
         window::{self, Id},
     },
@@ -27,7 +28,7 @@ use cosmic::{
 use cosmic_applet_fortivpn::{
     CONFIGURE_NAME, LIBEXEC_DIR,
     certcheck::{self, CertCheck},
-    gateway::Gateway,
+    gateway::{CertDigest, Gateway},
     protocol::UntrustedCert,
 };
 use std::time::Instant;
@@ -69,6 +70,13 @@ struct Agent {
     dialog: Option<(Id, Dialog)>,
     /// The "always trust this certificate" checkbox.
     always_trust: bool,
+    /// The certificate the user trusted in this session, for the login window. A certificate
+    /// trusted once is only in a root-only file, so the agent keeps its own note of it.
+    session_trust: Option<CertDigest>,
+    /// The running login window, stopped when the wait for the login ends.
+    login: Option<task::Handle>,
+    /// The login window failed this time: the system browser and the login dialog stand in.
+    browser_login: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +95,9 @@ enum Message {
     /// Drag on a dialog's header bar: move the window.
     Drag(Id),
     CertChecked(Result<CertCheck, String>),
+    LoginFinished(LoginResult),
+    /// The SAML id was handed to openfortivpn, or could not be.
+    HandedOver(Result<(), String>),
 }
 
 impl cosmic::Application for Agent {
@@ -115,6 +126,9 @@ impl cosmic::Application for Agent {
             configure_error: None,
             dialog: None,
             always_trust: true,
+            session_trust: None,
+            login: None,
+            browser_login: false,
         };
         (agent, Task::none())
     }
@@ -140,6 +154,7 @@ impl cosmic::Application for Agent {
         if self.status != before {
             tracing::info!(status = ?self.status, "status changed");
         }
+        self.end_login_if_done();
         self.publish();
         Task::batch([task, self.sync_dialog()])
     }
@@ -204,6 +219,20 @@ impl Agent {
                 let effect = self.status.on_cert_checked(untrusted);
                 return self.run(effect);
             }
+            Message::LoginFinished(result) => {
+                self.login = None;
+                if let LoginResult::Failed(why) = &result {
+                    tracing::warn!(%why, "login window failed, using the system browser");
+                }
+                let effect = self.status.on_login(result);
+                return self.run(effect);
+            }
+            Message::HandedOver(Ok(())) => {}
+            Message::HandedOver(Err(why)) => {
+                tracing::warn!(%why, "could not hand the login to openfortivpn");
+                let effect = self.status.fail(why);
+                return self.run(effect);
+            }
             Message::WindowClosed(id) => {
                 if self
                     .dialog
@@ -249,6 +278,7 @@ impl Agent {
                 return self.run(effect);
             }
             BusUpdate::Command(AgentCommand::SetGateway(address)) => {
+                self.session_trust = None;
                 return self.configure(vec!["set-gateway".into(), address], false);
             }
             BusUpdate::NameTaken => {
@@ -263,6 +293,19 @@ impl Agent {
             }
         }
         Task::none()
+    }
+
+    /// Stops the login window once the login is no longer wanted (cancelled from an applet),
+    /// and ends the browser fallback once openfortivpn no longer waits for the login.
+    fn end_login_if_done(&mut self) {
+        if self.status != Status::LoggingIn
+            && let Some(login) = self.login.take()
+        {
+            login.abort();
+        }
+        if self.status != Status::WaitingForLogin {
+            self.browser_login = false;
+        }
     }
 
     /// Carries out what a state transition asks for.
@@ -281,7 +324,14 @@ impl Agent {
                 }
                 Task::none()
             }
-            Effect::OpenLoginPage => self.open_login_page(),
+            Effect::Login => self.run_login(),
+            Effect::DeliverSamlId(id) => {
+                cosmic::task::future(async move { Message::HandedOver(login::hand_over(id).await) })
+            }
+            Effect::OpenLoginPage => {
+                self.browser_login = true;
+                self.open_login_page()
+            }
             Effect::CheckCert => self.check_cert(),
         }
     }
@@ -321,7 +371,31 @@ impl Agent {
             "trust-cert-once"
         };
         let args = vec![command.into(), cert.digest.to_string()];
+        self.session_trust = Some(cert.digest.clone());
         self.configure(args, true)
+    }
+
+    /// Runs the login window, before openfortivpn starts. Aborting the task kills it
+    /// (`kill_on_drop`).
+    fn run_login(&mut self) -> Task<cosmic::Action<Message>> {
+        let Ok(Some(gateway)) = &self.gateway else {
+            let why = "no gateway".to_owned();
+            return cosmic::task::message(Message::LoginFinished(LoginResult::Failed(why)));
+        };
+        let trusted = self
+            .session_trust
+            .clone()
+            .or_else(|| gateway.trusted_cert.clone());
+        let login = login::Login {
+            url: gateway.saml_login_url(),
+            host: gateway.host.clone(),
+            trusted,
+        };
+        let (task, handle) =
+            cosmic::task::future(async move { Message::LoginFinished(login::run(login).await) })
+                .abortable();
+        self.login = Some(handle);
+        task
     }
 
     /// Runs the configure helper through pkexec, which asks for the admin password.
@@ -359,7 +433,8 @@ impl Agent {
     fn sync_dialog(&mut self) -> Task<cosmic::Action<Message>> {
         let wanted = match &self.status {
             Status::CertUntrusted(cert) => Some(Dialog::Cert(cert.clone())),
-            Status::WaitingForLogin => Some(Dialog::Login),
+            // The login window speaks for itself; the dialog only points at the browser.
+            Status::WaitingForLogin if self.browser_login => Some(Dialog::Login),
             _ => None,
         };
         if self.dialog.as_ref().map(|(_, dialog)| dialog) == wanted.as_ref() {

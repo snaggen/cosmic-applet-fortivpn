@@ -2,7 +2,6 @@ vpn = VPN
 
 status-disconnected = Disconnected
 status-connecting = Connecting…
-status-waiting-for-login = Waiting for login in the browser…
 status-connected = Connected
 status-disconnecting = Disconnecting…
 status-cert-untrusted = Certificate not trusted
@@ -35,7 +34,6 @@ error-other = The VPN could not be started: { $reason }
 
 agent-unavailable = The VPN service is not running.
 cert-untrusted-hint = Decide about the gateway's certificate in the dialog.
-waiting-for-login-hint = Finish logging in in the browser.
 always-trust = Always trust this certificate
 trust = Trust
 

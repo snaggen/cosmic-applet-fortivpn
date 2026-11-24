@@ -228,7 +228,6 @@ impl Applet {
         match snapshot.state {
             State::Failed => Some(text::body(failure_text(snapshot)).into()),
             State::CertUntrusted => Some(text::body(fl!("cert-untrusted-hint")).into()),
-            State::WaitingForLogin => Some(text::body(fl!("waiting-for-login-hint")).into()),
             _ => None,
         }
     }
@@ -296,8 +295,9 @@ fn status_text(snapshot: Option<&Snapshot>) -> String {
     match snapshot.map(|s| s.state) {
         None => fl!("status-unavailable"),
         Some(State::Disconnected) => fl!("status-disconnected"),
-        Some(State::Connecting) => fl!("status-connecting"),
-        Some(State::WaitingForLogin) => fl!("status-waiting-for-login"),
+        // The login window or the browser dialog shows when the login needs the user;
+        // otherwise it runs unseen, so the applet only says it is connecting.
+        Some(State::Connecting | State::WaitingForLogin) => fl!("status-connecting"),
         Some(State::Connected) => fl!("status-connected"),
         Some(State::Disconnecting) => fl!("status-disconnecting"),
         Some(State::CertUntrusted) => fl!("status-cert-untrusted"),

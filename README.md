@@ -3,16 +3,21 @@
 A COSMIC panel applet for a Fortinet SSL VPN with SAML/SSO login, built on
 [openfortivpn](https://github.com/adrienverge/openfortivpn).
 
-**Status:** connects and disconnects, with SAML login in the system browser. The embedded
-login, statistics and suspend handling are still to come.
+**Status:** connects and disconnects with SAML login. Statistics and suspend handling are
+still to come.
 
-Requires `openfortivpn` (at `/usr/bin/openfortivpn`) and polkit.
+Requires `openfortivpn` (at `/usr/bin/openfortivpn`), polkit and WebKitGTK 4.1 (building needs
+`webkit2gtk4.1-devel` on Fedora).
 
 ## How it works
 
 The panel runs one applet per output, so the tunnel is owned by an agent instead: the same
 binary started with `--agent` through D-Bus activation, once per session. The applets show
-its state and send it Connect/Disconnect over the session bus. The agent opens a window in
+its state and send it Connect/Disconnect over the session bus. The SAML login runs first, in
+`cosmic-applet-fortivpn-login`, a WebKit window with its own profile that stays hidden while
+the IdP session is valid. It stops at the gateway's redirect to openfortivpn's listener; the
+agent then starts openfortivpn and hands it the session id, since openfortivpn waits only 50
+seconds for a login. Without the window the system browser is used. The agent opens a window in
 front of the user when they must act: to trust a certificate or to log in in the browser.
 
 openfortivpn needs root, so the agent starts `cosmic-applet-fortivpn-helper` through pkexec. The helper takes only the login from the

@@ -11,6 +11,7 @@ mod applet;
 mod bus;
 mod client;
 mod localize;
+mod login;
 mod state;
 mod tunnel;
 

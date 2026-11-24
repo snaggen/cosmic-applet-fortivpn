@@ -5,6 +5,8 @@ appid := 'io.github.snaggen.CosmicAppletFortivpn'
 # panel's PATH need not contain the prefix (it lacks ~/.local/bin by default).
 prefix := env_var('HOME') / '.local'
 bin-dst := prefix / 'bin' / name
+# The SAML login window; the agent looks for it next to its own binary.
+login-dst := prefix / 'bin' / name + '-login'
 desktop-dst := prefix / 'share' / 'applications' / appid + '.desktop'
 # D-Bus activation file that starts the agent (`cosmic-applet-fortivpn --agent`).
 dbus-service-dst := prefix / 'share' / 'dbus-1' / 'services' / appid + '.service'
@@ -33,6 +35,7 @@ check:
 # agent so the next use starts the new one; that also ends an open VPN connection.
 install: build-release
     install -Dm0755 target/release/{{name}} {{bin-dst}}
+    install -Dm0755 target/release/{{name}}-login {{login-dst}}
     install -d {{parent_directory(desktop-dst)}} {{parent_directory(dbus-service-dst)}}
     sed 's|^Exec=.*|Exec={{bin-dst}}|' data/{{appid}}.desktop > {{desktop-dst}}
     sed 's|@BIN@|{{bin-dst}}|' data/{{appid}}.service > {{dbus-service-dst}}
@@ -42,7 +45,7 @@ install: build-release
 
 uninstall:
     -pkill -f '^{{bin-dst}} --agent$'
-    rm -f {{bin-dst}} {{desktop-dst}} {{dbus-service-dst}}
+    rm -f {{bin-dst}} {{login-dst}} {{desktop-dst}} {{dbus-service-dst}}
 
 # Root helpers and polkit policy, through sudo
 install-helper: build-release

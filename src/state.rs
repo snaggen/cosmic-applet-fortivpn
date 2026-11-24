@@ -2,8 +2,14 @@
 
 //! The connection state machine, kept free of UI code so it can be tested.
 
-use crate::tunnel::{Ended, TunnelCommand};
-use cosmic_applet_fortivpn::protocol::{Event, HelperError, Request, UntrustedCert};
+use crate::{
+    login::LoginResult,
+    tunnel::{Ended, TunnelCommand},
+};
+use cosmic_applet_fortivpn::{
+    protocol::{Event, HelperError, Request, UntrustedCert},
+    saml::SamlId,
+};
 use std::time::Instant;
 
 /// pkexec's exit code when the user dismissed the authentication dialog.
@@ -17,9 +23,16 @@ pub enum Status {
     /// The agent checks the gateway certificate before anything else, so an untrusted
     /// certificate is asked about before the user logs in, not after.
     Checking,
-    /// The helper is starting openfortivpn.
+    /// The login window is open. openfortivpn is not started yet: it waits only 50 seconds
+    /// for the login.
+    LoggingIn,
+    /// The helper is starting openfortivpn, which then gets this id from the login.
+    Starting(SamlId),
+    /// The helper is starting openfortivpn, or openfortivpn has the login and sets up the
+    /// tunnel.
     Connecting,
-    /// openfortivpn waits for the SAML login in the browser.
+    /// openfortivpn waits for the SAML login: the id is being handed over, or the login runs
+    /// in the system browser.
     WaitingForLogin,
     Connected {
         since: Instant,
@@ -46,6 +59,11 @@ pub enum Failure {
 pub enum Effect {
     None,
     Send(TunnelCommand),
+    /// Run the login window, then report with [`Status::on_login`].
+    Login,
+    /// Hand openfortivpn the id from the login window (on its SAML listener).
+    DeliverSamlId(SamlId),
+    /// The login window failed: open the login page in the system browser.
     OpenLoginPage,
     /// Check the gateway certificate, then report with [`Status::on_cert_checked`].
     CheckCert,
@@ -56,27 +74,30 @@ impl Status {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Connecting | Self::WaitingForLogin | Self::Connected { .. } | Self::Disconnecting
+            Self::Starting(_)
+                | Self::Connecting
+                | Self::WaitingForLogin
+                | Self::Connected { .. }
+                | Self::Disconnecting
         )
     }
 
     /// Starts a connection: first the certificate check.
     pub fn connect(&mut self) -> Effect {
-        if self.is_active() || *self == Self::Checking {
+        if self.is_active() || matches!(self, Self::Checking | Self::LoggingIn) {
             return Effect::None;
         }
         *self = Self::Checking;
         Effect::CheckCert
     }
 
-    /// Starts the helper without a certificate check, after the user trusted the
-    /// certificate. A certificate trusted once is only known to the helper, so a new check
-    /// would ask again.
+    /// Logs in without a certificate check, after the user trusted the certificate. A
+    /// certificate trusted once is only known to the helper, so a new check would ask again.
     pub fn connect_trusted(&mut self) -> Effect {
-        if self.is_active() {
+        if self.is_active() || *self == Self::LoggingIn {
             return Effect::None;
         }
-        self.start_helper()
+        self.login()
     }
 
     /// The certificate check finished: `None` if trusted (or the check could not run, in
@@ -86,7 +107,7 @@ impl Status {
             return Effect::None;
         }
         match untrusted {
-            None => self.start_helper(),
+            None => self.login(),
             Some(cert) => {
                 *self = Self::CertUntrusted(cert);
                 Effect::None
@@ -94,19 +115,47 @@ impl Status {
         }
     }
 
-    fn start_helper(&mut self) -> Effect {
-        *self = Self::Connecting;
-        // Until the webview login exists (phase 4), openfortivpn takes the SAML redirect.
+    fn login(&mut self) -> Effect {
+        *self = Self::LoggingIn;
+        Effect::Login
+    }
+
+    /// The login window ended. With the id, openfortivpn starts and gets it once listening;
+    /// if the window failed, openfortivpn starts and the login runs in the system browser.
+    pub fn on_login(&mut self, result: LoginResult) -> Effect {
+        if *self != Self::LoggingIn {
+            return Effect::None;
+        }
+        *self = match result {
+            LoginResult::Done(id) => Self::Starting(id),
+            LoginResult::Failed(_) => Self::Connecting,
+            LoginResult::Cancelled => {
+                *self = Self::Disconnected;
+                return Effect::None;
+            }
+        };
         Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
+    }
+
+    /// Something the agent did for the connection failed: give up and stop the helper.
+    pub fn fail(&mut self, why: String) -> Effect {
+        if !self.is_active() {
+            return Effect::None;
+        }
+        *self = Self::Failed(Failure::Other(why));
+        Effect::Send(TunnelCommand::Disconnect)
     }
 
     pub fn disconnect(&mut self) -> Effect {
         match self {
-            Self::Connecting | Self::WaitingForLogin | Self::Connected { .. } => {
+            Self::Starting(_)
+            | Self::Connecting
+            | Self::WaitingForLogin
+            | Self::Connected { .. } => {
                 *self = Self::Disconnecting;
                 Effect::Send(TunnelCommand::Disconnect)
             }
-            Self::Checking | Self::CertUntrusted(_) | Self::Failed(_) => {
+            Self::Checking | Self::LoggingIn | Self::CertUntrusted(_) | Self::Failed(_) => {
                 *self = Self::Disconnected;
                 Effect::None
             }
@@ -118,8 +167,11 @@ impl Status {
     pub fn on_event(&mut self, event: Event, now: Instant) -> Effect {
         match event {
             Event::SamlReady if self.is_active() => {
-                *self = Self::WaitingForLogin;
-                return Effect::OpenLoginPage;
+                let previous = std::mem::replace(self, Self::WaitingForLogin);
+                return match previous {
+                    Self::Starting(id) => Effect::DeliverSamlId(id),
+                    _ => Effect::OpenLoginPage,
+                };
             }
             // The login is done; the login dialog closes while the tunnel comes up.
             Event::SamlReceived if *self == Self::WaitingForLogin => *self = Self::Connecting,
@@ -128,7 +180,7 @@ impl Status {
             Event::AuthFailed => *self = Self::Failed(Failure::AuthFailed),
             Event::Error(err) => *self = Self::Failed(failure_from(err)),
             Event::Exited(_) => self.on_exit(),
-            Event::Log(line) => tracing::debug!(%line, "openfortivpn"),
+            Event::Log(line) => tracing::info!(%line, "openfortivpn"),
             Event::SamlReady | Event::SamlReceived | Event::Up => {}
         }
         Effect::None
@@ -138,10 +190,17 @@ impl Status {
     fn on_exit(&mut self) {
         match self {
             Self::Disconnecting => *self = Self::Disconnected,
-            Self::Connecting | Self::WaitingForLogin | Self::Connected { .. } => {
+            Self::Starting(_)
+            | Self::Connecting
+            | Self::WaitingForLogin
+            | Self::Connected { .. } => {
                 *self = Self::Failed(Failure::Stopped);
             }
-            Self::Disconnected | Self::Checking | Self::CertUntrusted(_) | Self::Failed(_) => {}
+            Self::Disconnected
+            | Self::Checking
+            | Self::LoggingIn
+            | Self::CertUntrusted(_)
+            | Self::Failed(_) => {}
         }
     }
 
@@ -191,20 +250,27 @@ mod tests {
         }
     }
 
+    fn id() -> SamlId {
+        SamlId::parse("abc123").unwrap()
+    }
+
     #[test]
     fn saml_connect_and_disconnect() {
         let now = Instant::now();
         let mut status = Status::Disconnected;
         assert_eq!(status.connect(), Effect::CheckCert);
         assert_eq!(status, Status::Checking);
+        assert_eq!(status.on_cert_checked(None), Effect::Login);
+        assert_eq!(status, Status::LoggingIn);
+        assert!(!status.is_active());
         assert_eq!(
-            status.on_cert_checked(None),
+            status.on_login(LoginResult::Done(id())),
             Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
         );
-        assert_eq!(status, Status::Connecting);
+        assert_eq!(status, Status::Starting(id()));
         assert_eq!(
             status.on_event(Event::SamlReady, now),
-            Effect::OpenLoginPage
+            Effect::DeliverSamlId(id())
         );
         assert_eq!(status, Status::WaitingForLogin);
         status.on_event(Event::SamlReceived, now);
@@ -217,6 +283,52 @@ mod tests {
         assert_eq!(status, Status::Disconnected);
         status.on_ended(&ended(0, ""));
         assert_eq!(status, Status::Disconnected);
+    }
+
+    #[test]
+    fn failed_login_window_falls_back_to_the_browser() {
+        let now = Instant::now();
+        let mut status = Status::LoggingIn;
+        assert_eq!(
+            status.on_login(LoginResult::Failed("no window".into())),
+            Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
+        );
+        assert_eq!(status, Status::Connecting);
+        assert_eq!(
+            status.on_event(Event::SamlReady, now),
+            Effect::OpenLoginPage
+        );
+        assert_eq!(status, Status::WaitingForLogin);
+    }
+
+    #[test]
+    fn cancelled_login_starts_nothing() {
+        let mut status = Status::LoggingIn;
+        assert_eq!(status.on_login(LoginResult::Cancelled), Effect::None);
+        assert_eq!(status, Status::Disconnected);
+    }
+
+    #[test]
+    fn late_login_result_is_ignored() {
+        let mut status = Status::LoggingIn;
+        assert_eq!(status.disconnect(), Effect::None);
+        assert_eq!(status, Status::Disconnected);
+        assert_eq!(status.on_login(LoginResult::Done(id())), Effect::None);
+        assert_eq!(status, Status::Disconnected);
+    }
+
+    #[test]
+    fn failed_handover_stops_the_helper() {
+        let mut status = Status::WaitingForLogin;
+        assert_eq!(
+            status.fail("refused".into()),
+            Effect::Send(TunnelCommand::Disconnect)
+        );
+        assert_eq!(status, Status::Failed(Failure::Other("refused".into())));
+        // The helper's exit keeps the failure shown.
+        status.on_event(Event::Exited(Some(1)), Instant::now());
+        assert_eq!(status, Status::Failed(Failure::Other("refused".into())));
+        assert_eq!(Status::Disconnected.fail("x".into()), Effect::None);
     }
 
     #[test]
@@ -236,12 +348,10 @@ mod tests {
         status.connect();
         assert_eq!(status.on_cert_checked(Some(cert())), Effect::None);
         assert_eq!(status, Status::CertUntrusted(cert()));
-        // After the user trusts it, the helper starts without another check.
-        assert_eq!(
-            status.connect_trusted(),
-            Effect::Send(TunnelCommand::Connect(Request::SamlLogin))
-        );
-        assert_eq!(status, Status::Connecting);
+        // After the user trusts it, the login starts without another check.
+        assert_eq!(status.connect_trusted(), Effect::Login);
+        assert_eq!(status, Status::LoggingIn);
+        assert_eq!(status.connect(), Effect::None);
     }
 
     #[test]

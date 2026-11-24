@@ -2,7 +2,6 @@ vpn = VPN
 
 status-disconnected = Frånkopplad
 status-connecting = Ansluter…
-status-waiting-for-login = Väntar på inloggning i webbläsaren…
 status-connected = Ansluten
 status-disconnecting = Kopplar från…
 status-cert-untrusted = Certifikatet är inte betrott
@@ -35,7 +34,6 @@ error-other = VPN:et kunde inte startas: { $reason }
 
 agent-unavailable = VPN-tjänsten körs inte.
 cert-untrusted-hint = Ta ställning till gatewayens certifikat i dialogrutan.
-waiting-for-login-hint = Slutför inloggningen i webbläsaren.
 always-trust = Lita alltid på det här certifikatet
 trust = Lita på
 

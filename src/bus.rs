@@ -97,8 +97,8 @@ impl Snapshot {
         Self {
             state: match status {
                 Status::Disconnected => State::Disconnected,
-                Status::Checking | Status::Connecting => State::Connecting,
-                Status::WaitingForLogin => State::WaitingForLogin,
+                Status::Checking | Status::Starting(_) | Status::Connecting => State::Connecting,
+                Status::LoggingIn | Status::WaitingForLogin => State::WaitingForLogin,
                 Status::Connected { .. } => State::Connected,
                 Status::Disconnecting => State::Disconnecting,
                 Status::CertUntrusted(_) => State::CertUntrusted,

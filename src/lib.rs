@@ -15,6 +15,7 @@ pub mod certcheck;
 pub mod gateway;
 pub mod openfortivpn;
 pub mod protocol;
+pub mod saml;
 
 /// Directory of the root-only helpers. Must match where `just install-helper` puts them and
 /// the paths in the polkit policy.
