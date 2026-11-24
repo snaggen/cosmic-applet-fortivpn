@@ -35,6 +35,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "io.github.snaggen.CosmicAppletFortivpn";
 
+/// The panel icon while disconnected: a shield with a keyhole. Neutral (no cross, nothing
+/// looks wrong) and our own, so it is not mistaken for another VPN. The other states use the
+/// theme's VPN icons.
+const IDLE_ICON: &[u8] = include_bytes!(
+    "../data/icons/scalable/apps/io.github.snaggen.CosmicAppletFortivpn-symbolic.svg"
+);
+
 pub struct Applet {
     core: Core,
     /// The open popover, if any.
@@ -187,7 +194,7 @@ impl cosmic::Application for Applet {
     fn view(&self) -> Element<'_, Self::Message> {
         self.core
             .applet
-            .icon_button(panel_icon(self.snapshot.as_ref()))
+            .icon_button_from_handle(panel_icon(self.snapshot.as_ref()))
             .on_press_down(Message::TogglePopup)
             .into()
     }
@@ -347,7 +354,7 @@ impl Applet {
             details = details.push(text::caption(profile.name.clone()));
         }
         row![
-            icon::from_name(panel_icon(self.snapshot.as_ref())).size(24),
+            icon::icon(panel_icon(self.snapshot.as_ref())).size(24),
             details
         ]
         .spacing(spacing.space_xs)
@@ -598,15 +605,20 @@ fn new_profile_id(name: &str, existing: &[String]) -> Option<String> {
         .find(|id| !existing.contains(id) && id.parse::<ProfileId>().is_ok())
 }
 
-fn panel_icon(snapshot: Option<&Snapshot>) -> &'static str {
-    match snapshot.map(|s| s.state) {
-        Some(State::Disconnected) => "network-vpn-disconnected-symbolic",
+fn panel_icon(snapshot: Option<&Snapshot>) -> icon::Handle {
+    let name = match snapshot.map(|s| s.state) {
+        Some(State::Disconnected) => {
+            let mut idle = icon::from_svg_bytes(IDLE_ICON);
+            idle.symbolic = true;
+            return idle;
+        }
         Some(
             State::Connecting | State::WaitingForLogin | State::Disconnecting | State::Reconnecting,
         ) => "network-vpn-acquiring-symbolic",
         Some(State::Connected) => "network-vpn-symbolic",
         Some(State::CertUntrusted | State::Failed) | None => "network-vpn-error-symbolic",
-    }
+    };
+    icon::from_name(name).symbolic(true).handle()
 }
 
 fn status_text(snapshot: Option<&Snapshot>) -> String {

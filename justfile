@@ -10,6 +10,7 @@ login-dst := prefix / 'bin' / name + '-login'
 desktop-dst := prefix / 'share' / 'applications' / appid + '.desktop'
 # D-Bus activation file that starts the agent (`cosmic-applet-fortivpn --agent`).
 dbus-service-dst := prefix / 'share' / 'dbus-1' / 'services' / appid + '.service'
+icon-dst := prefix / 'share' / 'icons' / 'hicolor' / 'scalable' / 'apps' / appid + '-symbolic.svg'
 
 # Root-only helpers. Must be root-owned and not writable by the user, since polkit lets
 # the active user run the connect helper as root without a password.
@@ -40,12 +41,13 @@ install: build-release
     sed 's|^Exec=.*|Exec={{bin-dst}}|' data/{{appid}}.desktop > {{desktop-dst}}
     sed 's|@BIN@|{{bin-dst}}|' data/{{appid}}.service > {{dbus-service-dst}}
     chmod 0644 {{desktop-dst}} {{dbus-service-dst}}
+    install -Dm0644 data/icons/scalable/apps/{{appid}}-symbolic.svg {{icon-dst}}
     -busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
     -pkill -f '^{{bin-dst}} --agent$'
 
 uninstall:
     -pkill -f '^{{bin-dst}} --agent$'
-    rm -f {{bin-dst}} {{login-dst}} {{desktop-dst}} {{dbus-service-dst}}
+    rm -f {{bin-dst}} {{login-dst}} {{desktop-dst}} {{dbus-service-dst}} {{icon-dst}}
 
 # Root helpers and polkit policy, through sudo
 install-helper: build-release
